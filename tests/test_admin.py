@@ -339,6 +339,8 @@ def test_the_widget_renders_what_was_saved(app: Flask, client: FlaskClient) -> N
     from PIL import Image
 
     Image.new("L", (700, 1342), 255).save(pages / f"TX_HC_{today:%Y%m%d}.jpg", "JPEG")
+    # Its PDF too: today's edition is whole, so the render queues no download.
+    (pages / f"TX_HC_{today:%Y%m%d}.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
     with app.test_request_context():
         data = _module(app).fetch({"paper": ""}, {}, ctx={"data_dir": str(_dir(app))})
     assert (data["code"], data["css"], data["fit"]) == ("TX_HC", "opacity: 0.8", "top")

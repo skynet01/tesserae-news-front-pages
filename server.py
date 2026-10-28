@@ -4,14 +4,36 @@
 what is missing for one background download worker, so a render never waits on
 a download.
 
-Freedom Forum publishes each paper as a JPEG at
-``https://cdn.freedomforum.org/dfp/jpg<day-of-month>/lg/<CODE>.jpg``. Two
-quirks shape the code below:
+Freedom Forum publishes each paper as a PDF at
+``https://cdn.freedomforum.org/dfp/pdf<day-of-month>/<CODE>.pdf`` and as a
+JPEG at ``.../dfp/jpg<day-of-month>/lg/<CODE>.jpg``. Three quirks shape the
+code below:
 
 * The path names only the day of the month, so each slot is reused every
   month. Freedom Forum clears a slot a couple of days after the edition, and a
   ``Last-Modified`` well before the edition date is refused anyway, so a slot
   that wasn't cleared can't pass last month's paper off as today's.
+* The ``lg`` JPEG is only about 700 px wide: on a 1440 px panel it is an
+  upscale, and body text can't be read. So the PDF is fetched too and the
+  page is drawn from its own vectors and fonts, in one of two ways:
+
+  - Where ``pypdfium2`` happens to be importable (it is never a dependency
+    of this widget), the worker draws page one at ``RASTER_WIDTH_PX`` itself,
+    in a child process with a wall-clock timeout and capped CPU time and
+    address space, so a PDF that hangs or balloons costs that process, never
+    the server, and saves that as the page.
+  - Everywhere else (and when that drawing fails) the PDF is kept beside the
+    JPEG as ``<CODE>_<YYYYMMDD>.pdf`` and client.js draws it with the
+    vendored PDF.js (``static/pdfjs``) in the panel's own browser, at the
+    cell's pixel width. The JPEG stays the page on record (its size lays the
+    cell out, and client.js falls back to it).
+
+  The PDF is capped at ``MAX_PDF_BYTES``. A page with no PDF yet (not out,
+  refused, an outage) is asked for again on a backoff (``pdf_retry`` in
+  state.json), a bounded number of times, and at once on a forced refresh.
+  With the rasteriser, the PDF leaves ``JPEG_RESERVE_S`` of an edition's time
+  for the JPEG, so a slow PDF can't starve the fallback; without it, the
+  JPEG comes first and the PDF gets the time left.
 * Editions land shortly after midnight US Eastern, so "today" is the Eastern
   date whatever the server's own time zone is. A paper that isn't out yet (or
   doesn't print that day, like the Sunday WSJ) falls back to yesterday's and
@@ -51,7 +73,10 @@ Layout under ``data_dir``::
 
     config.json                   the papers and the small-screens choice, as
                                   the admin page saves them
-    pages/<CODE>_<YYYYMMDD>.jpg   one validated page per paper and edition
+    pages/<CODE>_<YYYYMMDD>.jpg   one validated page per paper and edition (the
+                                  PDF drawn at panel width, or the JPEG)
+    pages/<CODE>_<YYYYMMDD>.pdf   that edition's PDF, beside a JPEG page, for
+                                  client.js to draw (a paper's newest only)
     state.json                    paper shown, since when and the order it came from;
                                   download attempts and failures; the fetch log
     directory.json                Freedom Forum's paper list, for the editor's picker
@@ -77,6 +102,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -142,6 +168,7 @@ def _sibling(name: str) -> ModuleType:
 lifecycle = _sibling("media_lifecycle")
 
 PAGE_URL = "https://cdn.freedomforum.org/dfp/jpg{day}/lg/{code}.jpg"
+PDF_URL = "https://cdn.freedomforum.org/dfp/pdf{day}/{code}.pdf"
 SITEMAP_URL = "https://frontpages.freedomforum.org/sitemap.xml"
 USER_AGENT = f"tesserae/0.1 (+{PLUGIN_ID})"
 
@@ -166,7 +193,32 @@ MAX_QUEUED = 32
 # All of one job's requests (today, yesterday, the day before) together; a
 # request in flight can overrun it by one socket timeout.
 JOB_BUDGET_S = 90.0
-# The longest one job can take.
+# The optional rasteriser (pypdfium2, see rasterise_pdf) runs in a child
+# process: page one only, at RASTER_WIDTH_PX, killed after RASTER_TIMEOUT_S of
+# wall time, with its CPU time and address space capped where the platform
+# allows.
+RASTER_WIDTH_PX = 1440
+RASTER_TIMEOUT_S = 45.0
+# Below this much time left in the PDF's share of an edition's window, the
+# page isn't drawn (the JPEG gets its turn instead).
+RASTER_MIN_S = 5.0
+# Of an edition's DOWNLOAD_BUDGET_S, what the PDF (download and drawing)
+# leaves for the JPEG fallback when the rasteriser draws it.
+JPEG_RESERVE_S = 20.0
+# Today's page with no PDF asks for its PDF again on a backoff (PDF_RETRY_S,
+# doubling, up to PDF_RETRY_MAX_S), at most PDF_MAX_TRIES times an edition; a
+# forced refresh asks at once whatever the count.
+PDF_RETRY_S = 30 * 60
+PDF_RETRY_MAX_S = 6 * 60 * 60
+PDF_MAX_TRIES = 6
+RASTER_CPU_S = 30
+RASTER_MEMORY_BYTES = 1536 * 1024 * 1024
+RASTER_MAX_ASPECT = 4.0
+MAX_PDF_BYTES = 30 * 1024 * 1024
+# A saved page narrower than this is the JPEG (sharp only with its PDF beside it).
+SHARP_MIN_WIDTH_PX = 1000
+# The longest one job can take: drawing runs inside the job's deadline, and a
+# request in flight can overrun it by one socket timeout.
 JOB_WORST_S = JOB_BUDGET_S + HTTP_TIMEOUT_S
 # The host follows a push up at most this many times in a row
 # (FOLLOWUP_LIMIT in app/push.py); the hint is spread so they cover the wait.
@@ -214,6 +266,7 @@ CODE_MAX_CHARS = 40
 
 CODE_RE = re.compile(rf"^[A-Za-z0-9_-]{{1,{CODE_MAX_CHARS}}}$")
 _PAGE_FILE_RE = re.compile(r"^([A-Z0-9_-]+)_(\d{8})\.jpg$")
+_PDF_FILE_RE = re.compile(r"^([A-Z0-9_-]+)_(\d{8})\.pdf$")
 _SITEMAP_SLUG_RE = re.compile(r"<loc>\s*https://frontpages\.freedomforum\.org/newspapers/([^<\s]+)")
 
 # Freedom Forum publishes on US Eastern time; see the module docstring.
@@ -261,8 +314,9 @@ def _shared(name: str, factory: Callable[[], Any]) -> Any:
 _LOCK: threading.Lock = _shared("state_lock", threading.Lock)
 # Guards the worker registry below.
 _RUNS_LOCK: threading.Lock = _shared("runs_lock", threading.Lock)
-# One Verify check at a time per process, so a burst of clicks can't stack
-# downloads.
+# One Verify check at a time per process: each may download a PDF and draw it
+# (a child process of up to RASTER_MEMORY_BYTES), so a burst of clicks can't
+# stack them.
 _VERIFY_LOCK: threading.Lock = _shared("verify_lock", threading.Lock)
 # The last page each placement got under the lock, for a render that can't
 # have the lock in time: (data dir, pinned code or "") -> (wall time, payload).
@@ -297,6 +351,13 @@ class Page:
     day: date
     width: int
     height: int
+    pdf: Path | None = None  # its PDF, kept beside a JPEG page for client.js to draw
+
+    @property
+    def sharp(self) -> bool:
+        """Drawn from the PDF: by the worker (a wide page) or, with its PDF
+        beside it, by client.js."""
+        return self.width >= SHARP_MIN_WIDTH_PX or self.pdf is not None
 
 
 # ----- settings --------------------------------------------------------------
@@ -861,30 +922,168 @@ def _get(url: str, deadline: float, cap: int, accept: str) -> tuple[bytes, str |
     return body, last_modified
 
 
+def pdf_complete(body: bytes) -> bool:
+    """Whether ``body`` looks like a whole PDF: its header, and the end-of-file
+    marker near the end, which a cut-off download lacks. Whether it draws is
+    for the drawing (the rasteriser, or PDF.js with the JPEG to fall back to)."""
+    return body.startswith(b"%PDF-") and b"%%EOF" in body[-2048:]
+
+
+# Runs in a child process (``python -I -c``), so a PDF that hangs, crashes
+# or balloons the rasteriser takes down that process, never the server. It
+# caps its own address space and CPU time first (where ``resource`` exists:
+# Linux and macOS), reads the PDF from stdin and writes page one as a JPEG,
+# ``argv[1]`` pixels wide, to stdout. Exit 3 is a PDF it won't draw.
+_RASTER_CHILD = r"""
+import io
+import sys
+
+width, memory, cpu, max_aspect = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+try:
+    import resource
+except ImportError:
+    resource = None
+if resource is not None:
+    for name, value in (("RLIMIT_AS", memory), ("RLIMIT_CPU", cpu)):
+        limit = getattr(resource, name, None)
+        if limit is not None:
+            try:
+                resource.setrlimit(limit, (value, value))
+            except (ValueError, OSError):
+                pass
+import pypdfium2
+document = pypdfium2.PdfDocument(sys.stdin.buffer.read())
+if len(document) < 1:
+    sys.exit(3)
+page = document[0]
+w, h = page.get_size()
+if not (w > 0 and h > 0) or h / w > max_aspect or w / h > max_aspect:
+    sys.exit(3)
+image = page.render(scale=width / w).to_pil().convert("RGB")
+out = io.BytesIO()
+image.save(out, "JPEG", quality=90, subsampling=0, optimize=True)
+sys.stdout.buffer.write(out.getvalue())
+"""
+
+
+@functools.cache
+def rasteriser_available() -> bool:
+    """Whether pypdfium2 happens to be installed on this host. It is never a
+    dependency of this widget: without it, client.js draws the PDF with
+    PDF.js. Looked up, not imported: only the child process ever loads it."""
+    return importlib.util.find_spec("pypdfium2") is not None
+
+
+def rasterise_pdf(
+    body: bytes, width: int = RASTER_WIDTH_PX, timeout: float = RASTER_TIMEOUT_S
+) -> bytes | None:
+    """Page one of the PDF ``body`` as a JPEG ``width`` pixels wide, drawn
+    at that width from the PDF's own vectors and fonts (never an upscaled
+    bitmap), or None when it can't be drawn: no rasteriser, a broken or odd
+    PDF, the child over its time or memory. Blocks for at most ``timeout``
+    (and never more than ``RASTER_TIMEOUT_S``); the worker thread and Verify
+    are the only callers."""
+    timeout = min(timeout, RASTER_TIMEOUT_S)
+    if not rasteriser_available() or timeout <= 0:
+        return None
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        _RASTER_CHILD,
+        str(width),
+        str(RASTER_MEMORY_BYTES),
+        str(RASTER_CPU_S),
+        str(RASTER_MAX_ASPECT),
+    ]
+    try:
+        done = subprocess.run(
+            command, input=body, capture_output=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("%s: PDF rasteriser timed out", PLUGIN_ID)
+        return None
+    except (OSError, ValueError) as err:
+        logger.warning("%s: PDF rasteriser didn't start: %s", PLUGIN_ID, err)
+        return None
+    if done.returncode != 0:
+        detail = done.stderr[-300:].decode("utf-8", "replace").strip()
+        logger.warning("%s: PDF rasteriser failed (%s) %s", PLUGIN_ID, done.returncode, detail)
+        return None
+    size = page_size(done.stdout)
+    if size is None or abs(size[0] - width) > 2:
+        logger.warning("%s: PDF rasteriser returned no usable page", PLUGIN_ID)
+        return None
+    return done.stdout
+
+
 @dataclass
 class Trace:
-    """What one ``download_edition`` call did, for the worker's log: why the
-    page wasn't there when it wasn't."""
+    """What one ``download_edition`` call did, for the worker's log: where
+    the page it returned came from, and why the PDF or the JPEG wasn't used
+    when it wasn't."""
 
+    source: str = ""  # "PDF" (drawn here), "JPG" (maybe with its PDF), "its PDF" (alone)
+    pdf: str = ""
     jpg: str = ""
 
 
-def download_edition(
-    code: str,
-    day: date,
-    deadline: float | None = None,
-    *,
-    trace: Trace | None = None,
-) -> bytes | None:
-    """The ``code`` front page for ``day``, validated, or None when that
-    edition isn't there. The page is the ``lg`` JPEG, within one
-    ``DOWNLOAD_BUDGET_S`` window (and ``deadline``, on ``_clock``). Raises
-    :class:`CdnUnreachable` when the CDN fails or the time runs out.
-    ``trace``, when given, is filled in for the worker's log."""
-    trace = trace if trace is not None else Trace()
-    deadline = min(deadline if deadline is not None else math.inf, _clock() + DOWNLOAD_BUDGET_S)
-    if deadline <= _clock():
-        raise CdnUnreachable("out of time")
+@dataclass(frozen=True)
+class Edition:
+    """One downloaded edition. ``page`` is the image to save as the page: the
+    PDF drawn here, or the JPEG; None when only the PDF was asked for (the
+    saved JPEG stays). ``pdf`` is the PDF to keep beside a JPEG page, for
+    client.js to draw; None when there is none or the page is drawn from it."""
+
+    page: bytes | None
+    pdf: bytes | None = None
+
+
+def _pdf_file(code: str, day: date, deadline: float, *, quiet: bool, trace: Trace) -> bytes | None:
+    """The ``code`` PDF for ``day``, checked (size, slot age, a whole file),
+    or None when there's none to be had. With ``quiet`` a CDN failure is a
+    None too; without, it raises :class:`CdnUnreachable`."""
+    try:
+        got = _get(
+            PDF_URL.format(day=day.day, code=code), deadline, MAX_PDF_BYTES, "application/pdf"
+        )
+    except CdnUnreachable as err:
+        trace.pdf = f"unreachable ({_short(err)})"
+        if not quiet:
+            raise
+        logger.info("%s: %s PDF for %s unavailable (%s)", PLUGIN_ID, code, day, err)
+        return None
+    if got is None:
+        trace.pdf = "not out yet"
+        return None
+    body, last_modified = got
+    if len(body) > MAX_PDF_BYTES or _slot_is_stale(last_modified, day):
+        trace.pdf = "refused (too big, or last month's file)"
+        logger.info("%s: %s PDF for %s refused (oversized or stale slot)", PLUGIN_ID, code, day)
+        return None
+    if not pdf_complete(body):
+        trace.pdf = "not a whole PDF"
+        logger.info("%s: %s PDF for %s is not a whole PDF", PLUGIN_ID, code, day)
+        return None
+    return body
+
+
+def _drawn(body: bytes, deadline: float, trace: Trace) -> bytes | None:
+    """The PDF ``body`` drawn here by the rasteriser within ``deadline``, or
+    None (no time left, or it didn't draw)."""
+    left = deadline - _clock()
+    if left < RASTER_MIN_S:
+        trace.pdf = "no time left to draw it"
+        return None
+    page = rasterise_pdf(body, timeout=left)
+    if page is None:
+        trace.pdf = f"didn't draw here ({_kb(len(body))})"
+    return page
+
+
+def _jpeg(code: str, day: date, deadline: float, trace: Trace) -> bytes | None:
+    """The ``lg`` JPEG of ``code`` for ``day``, validated, or None when it
+    isn't there. Raises :class:`CdnUnreachable`."""
     got = _get(
         PAGE_URL.format(day=day.day, code=code),
         deadline,
@@ -906,11 +1105,67 @@ def download_edition(
     return body
 
 
+def download_edition(
+    code: str,
+    day: date,
+    deadline: float | None = None,
+    *,
+    pdf_only: bool = False,
+    trace: Trace | None = None,
+) -> Edition | None:
+    """The ``code`` front page for ``day``, validated, or None when that
+    edition isn't there. All within one ``DOWNLOAD_BUDGET_S`` window (and
+    ``deadline``, on ``_clock``).
+
+    With the rasteriser the PDF comes first, drawn at panel width, leaving
+    ``JPEG_RESERVE_S`` for the ``lg`` JPEG fallback; a PDF that came but
+    didn't draw is kept beside the JPEG. Without it the JPEG comes first (no
+    JPEG, no edition: it is the page on record) and the PDF, kept beside it,
+    gets the time left. ``pdf_only`` asks for the PDF alone, for a page
+    already saved from the JPEG. Raises :class:`CdnUnreachable` when the CDN
+    fails or the time runs out (for the PDF only when ``pdf_only``).
+    ``trace``, when given, is filled in for the worker's log."""
+    trace = trace if trace is not None else Trace()
+    deadline = min(deadline if deadline is not None else math.inf, _clock() + DOWNLOAD_BUDGET_S)
+    if deadline <= _clock():
+        raise CdnUnreachable("out of time")
+    drawable = rasteriser_available()
+    if pdf_only:
+        body = _pdf_file(code, day, deadline, quiet=False, trace=trace)
+        if body is None:
+            return None
+        page = _drawn(body, deadline, trace) if drawable else None
+        if page is not None:
+            trace.source = "PDF"
+            return Edition(page)
+        trace.source = "its PDF"
+        return Edition(None, body)
+    pdf: bytes | None = None
+    asked = False
+    if drawable and deadline - JPEG_RESERVE_S > _clock():
+        asked = True
+        pdf = _pdf_file(code, day, deadline - JPEG_RESERVE_S, quiet=True, trace=trace)
+        page = _drawn(pdf, deadline - JPEG_RESERVE_S, trace) if pdf is not None else None
+        if page is not None:
+            trace.source = "PDF"
+            return Edition(page)
+    elif drawable:
+        trace.pdf = "skipped, no time left"
+        asked = True
+    jpeg = _jpeg(code, day, deadline, trace)
+    if jpeg is None:
+        return None
+    if not asked:
+        pdf = _pdf_file(code, day, deadline, quiet=True, trace=trace)
+    trace.source = "JPG"
+    return Edition(jpeg, pdf)
+
+
 # ----- the pages on disk (callers hold _LOCK) --------------------------------
 
 
 def _page_day(name: str) -> tuple[str, date] | None:
-    match = _PAGE_FILE_RE.match(name)
+    match = _PAGE_FILE_RE.match(name) or _PDF_FILE_RE.match(name)
     if match is None:
         return None
     try:
@@ -923,11 +1178,38 @@ def edition_path(pages: Path, code: str, day: date) -> Path:
     return pages / f"{code}_{day:%Y%m%d}.jpg"
 
 
+def pdf_path(page: Path) -> Path:
+    """Where the PDF of the edition saved as ``page`` is kept."""
+    return page.with_suffix(".pdf")
+
+
+def _pdf_beside(page: Path) -> Path | None:
+    """The PDF kept beside the page ``page``, when there is one that starts
+    like a PDF and isn't over the cap; a file that doesn't is deleted (that
+    exact version only), so it can't hold off the download of a good one.
+    Reads a few bytes, never the whole file: a render calls this."""
+    path = pdf_path(page)
+    identity = _identity(path)
+    if identity is None:
+        return None
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(5)
+    except OSError:
+        return None
+    if head == b"%PDF-" and 0 < identity[1] <= MAX_PDF_BYTES:
+        return path
+    if _unlink_if_same(path, identity):
+        logger.warning("%s: removed unreadable %s", PLUGIN_ID, path.name)
+    return None
+
+
 def newest_page(pages: Path, code: str, today: date) -> Page | None:
-    """The paper's newest saved edition that decodes and isn't too old to show.
-    A file that doesn't decode (zero bytes, damaged) is deleted on the way, so
-    it can neither hide an older good page nor stand in for today's and block
-    its download; only that exact version is deleted, never a replacement."""
+    """The paper's newest saved edition that decodes and isn't too old to show,
+    with its PDF when one is kept beside it. A file that doesn't decode (zero
+    bytes, damaged) is deleted on the way, so it can neither hide an older
+    good page nor stand in for today's and block its download; only that
+    exact version is deleted, never a replacement."""
     oldest = today - timedelta(days=LAST_GOOD_MAX_DAYS)
     dated: list[tuple[date, Path]] = []
     for path in pages.glob(f"{code}_*.jpg"):
@@ -941,19 +1223,41 @@ def newest_page(pages: Path, code: str, today: date) -> Page | None:
         except OSError:
             continue
         if size is not None:
-            return Page(path, day, *size)
+            return Page(path, day, *size, pdf=_pdf_beside(path))
         if _unlink_if_same(path, identity):
             logger.warning("%s: removed unreadable %s", PLUGIN_ID, path.name)
     return None
 
 
+def _saved_width(path: Path) -> int | None:
+    """A saved page's width from its header alone (no decode), or None."""
+    try:
+        with Image.open(path) as img:
+            return int(img.size[0])
+    except Exception:  # missing, half-written, not an image
+        return None
+
+
+def _is_sharp(path: Path) -> bool:
+    """Whether the saved page at ``path`` is drawn from its PDF (here, so
+    wide; or by client.js, from the PDF beside it). Cheap: a header and a
+    file check, no decode."""
+    if pdf_path(path).is_file():
+        return True
+    width = _saved_width(path)
+    return width is not None and width >= SHARP_MIN_WIDTH_PX
+
+
 def _claim(page: Page) -> bool:
-    """Mark ``page`` as just used, so pruning leaves it for ``PRUNE_GRACE_S``.
-    Only a claimed page's URL is ever handed out."""
+    """Mark ``page`` (and the PDF beside it) as just used, so pruning leaves
+    it for ``PRUNE_GRACE_S``. Only a claimed page's URL is ever handed out."""
     try:
         os.utime(page.path)
     except OSError:
         return False
+    if page.pdf is not None:
+        with contextlib.suppress(OSError):
+            os.utime(page.pdf)
     return True
 
 
@@ -968,12 +1272,15 @@ def prune(
     last good page), everything past ``LAST_GOOD_MAX_DAYS``, a paper's pages
     once no render has asked for it in ``ORPHAN_AFTER_S`` (a paper taken off
     the list; ``wanted`` is the codes still asked for, when known), and temp
-    files an interrupted write left behind; each only once it has gone unused
-    for ``PRUNE_GRACE_S``, since a renderer may still be loading a page a
-    render handed out a moment ago. Then, while the folder is over
-    ``max_bytes`` (default MAX_BYTES), the oldest pages that aren't a wanted
-    paper's newest go first (media_lifecycle.py); a wanted paper's newest
-    page, the one on screen, never does. Returns the files deleted."""
+    files an interrupted write left behind. A PDF is only kept beside its
+    paper's newest page while that page is the JPEG (a page drawn here
+    doesn't need it); older editions' PDFs go. Each only once it has gone
+    unused for ``PRUNE_GRACE_S``, since a renderer may still be loading a
+    file a render handed out a moment ago. Then, while the folder (pages and
+    PDFs) is over ``max_bytes`` (default MAX_BYTES), the oldest files that
+    aren't a wanted paper's newest go first (media_lifecycle.py); a wanted
+    paper's newest page and its PDF, the ones on screen, never do. Returns
+    the files deleted."""
     found: list[tuple[Path, str, date]] = []
     newest: dict[str, date] = {}
     for path in pages.glob("*.jpg"):
@@ -989,6 +1296,19 @@ def prune(
             doomed.append(path)
         elif orphan:
             doomed.append(path)  # the newest of a paper nobody asks for any more
+    for path in pages.glob("*.pdf"):
+        parsed = _page_day(path.name)
+        if parsed is None:
+            continue
+        code, day = parsed
+        page = path.with_suffix(".jpg")
+        if (
+            day != newest.get(code)
+            or page in doomed
+            or (wanted is not None and code not in wanted)
+            or (_saved_width(page) or 0) >= SHARP_MIN_WIDTH_PX
+        ):
+            doomed.append(path)
     gone: list[str] = []
     for path in doomed:
         identity = _identity(path)
@@ -998,18 +1318,18 @@ def prune(
             and _unlink_if_same(path, identity)
         ):
             gone.append(path.name)
-    protected = {
-        edition_path(pages, code, day).name
-        for code, day in newest.items()
-        if wanted is None or code in wanted
-    }
+    protected = set()
+    for code, day in newest.items():
+        if wanted is None or code in wanted:
+            page = edition_path(pages, code, day)
+            protected |= {page.name, pdf_path(page).name}
     gone += lifecycle.sweep(
         pages,
         keep=protected,
         max_bytes=MAX_BYTES if max_bytes is None else max_bytes,
         grace_s=float("inf"),
         now=now,
-        pattern="*.jpg",
+        pattern=("*.jpg", "*.pdf"),
     )
     return gone
 
@@ -1234,11 +1554,41 @@ def _work(run: _Run) -> None:
                 jobs.finish(PLUGIN_ID, "download")
 
 
+def _pdf_retry(state: dict[str, Any], code: str, day: date) -> tuple[int, float]:
+    """How many times the PDF of ``code``'s ``day`` edition has been asked
+    for and failed, and when it may be asked for again (wall time)."""
+    entry = _section(state, "pdf_retry").get(code)
+    if not isinstance(entry, dict) or entry.get("day") != day.isoformat():
+        return 0, 0.0
+    tries, after = entry.get("tries"), entry.get("after")
+    if isinstance(tries, bool) or not isinstance(tries, int) or not isinstance(after, (int, float)):
+        return 0, 0.0
+    return tries, float(after)
+
+
+def _wants_sharper(
+    code: str, day: date, sharp: bool, state: dict[str, Any], now: float, force: bool
+) -> bool:
+    """Whether the saved ``day`` page of ``code`` (``sharp`` when it is drawn
+    from its PDF) is the blurry JPEG alone, and its PDF may be asked for now.
+    A PDF that wasn't there (not out yet, say) or didn't come is asked for
+    again on a backoff, up to ``PDF_MAX_TRIES`` times an edition; a forced
+    refresh asks at once. Pages saved before the PDF came back to this
+    widget are of this kind too, so today's get theirs; older ones age out."""
+    if sharp:
+        return False
+    if force:
+        return True
+    tries, after = _pdf_retry(state, code, day)
+    return tries < PDF_MAX_TRIES and now >= after
+
+
 def _refresh(data_dir: Path, job: _Job) -> None:
     """One job: look at the state again (the render that queued it read it
     before earlier jobs landed), download outside the lock, save under it.
-    What it asked for and got goes to the log the admin page shows
-    (``state["log"]``)."""
+    Today's page already saved as the blurry JPEG alone gets its PDF when
+    that may now work (``_wants_sharper``). What it asked for and got goes
+    to the log the admin page shows (``state["log"]``)."""
     pages = data_dir / PAGES_DIR
     state_path = data_dir / STATE_FILE
     with _LOCK:
@@ -1246,45 +1596,78 @@ def _refresh(data_dir: Path, job: _Job) -> None:
         if not job.force and _recently_checked(state, job.code, _wall(), job.today):
             return
         have = newest_page(pages, job.code, job.today)
-    if have is not None and have.day >= job.today:
+    current = have is not None and have.day >= job.today
+    sharpen = (
+        current
+        and have is not None
+        and _wants_sharper(job.code, have.day, have.sharp, state, _wall(), job.force)
+    )
+    if current and not sharpen:
         return
     notes: list[Note] = []
 
     def note(text: str, outcome: str = "") -> None:
         notes.append((_wall(), text, outcome))
 
-    saved: tuple[date, bytes] | None = None
-    took = 0.0
+    if sharpen and have is not None:
+        tries = _pdf_retry(state, job.code, have.day)[0]
+        which = f"try {tries + 1} of {PDF_MAX_TRIES}" if tries < PDF_MAX_TRIES else "a refresh"
+        note(f"{have.day}: saved from the JPG, asking for the PDF again ({which})")
+    saved: tuple[date, Edition] | None = None
+    saved_how: tuple[Trace, float] | None = None
     failure = "missing"
     deadline = _clock() + JOB_BUDGET_S
     for back in range(LOOKBACK_DAYS):
         day = job.today - timedelta(days=back)
-        if have is not None and day <= have.day:
+        if have is not None and (day < have.day or (day == have.day and not sharpen)):
             break  # nothing older can beat an edition already kept
         trace = Trace()
         started = _clock()
         try:
-            body = download_edition(job.code, day, deadline, trace=trace)
+            got = download_edition(job.code, day, deadline, pdf_only=sharpen, trace=trace)
         except Exception as err:  # CdnUnreachable, or the host refusing the egress
             logger.warning("%s: Freedom Forum unreachable (%s)", PLUGIN_ID, err)
             note(f"{day}: Freedom Forum unreachable ({_short(err)})", "error")
             failure = "unreachable"
             break
-        if body is not None:
-            saved = (day, body)
-            took = max(0.0, _clock() - started)
+        if got is not None:
+            saved = (day, got)
+            saved_how = (trace, max(0.0, _clock() - started))
             break
-        note(f"{day}: {_not_found(trace)}", "missing")
-    size = page_size(saved[1]) if saved is not None else None
+        note(f"{day}: {_not_found(trace, pdf_only=sharpen)}", "missing")
+    page_body = saved[1].page if saved is not None else None
+    size = page_size(page_body) if page_body is not None else None
+    # The edition left on the JPEG alone by this job, whose PDF is asked for
+    # again later: a JPEG saved without its PDF, or a PDF retry that came to
+    # nothing (no PDF yet, a broken one, an outage).
+    blurry_day: date | None = None
+    sharp_day: date | None = None
+    if saved is not None:
+        drawn_here = size is not None and size[0] >= SHARP_MIN_WIDTH_PX
+        if drawn_here or saved[1].pdf is not None:
+            sharp_day = saved[0]
+        else:
+            blurry_day = saved[0]
+    elif sharpen and have is not None:
+        blurry_day = have.day
     now = _wall()
     with _LOCK:
         if saved is not None:
+            day, edition = saved
+            page_file = edition_path(pages, job.code, day)
             try:
-                _write_atomic(edition_path(pages, job.code, saved[0]), saved[1])
+                # The PDF first: a render that sees the new page finds its PDF.
+                if edition.pdf is not None:
+                    _write_atomic(pdf_path(page_file), edition.pdf)
+                if edition.page is not None:
+                    _write_atomic(page_file, edition.page)
             except OSError as err:
                 logger.warning("%s: could not save %s: %s", PLUGIN_ID, job.code, err)
-                note(f"{saved[0]}: downloaded, but couldn't be saved ({_short(err)})", "error")
+                note(f"{day}: downloaded, but couldn't be saved ({_short(err)})", "error")
                 saved = None
+                blurry_day = sharp_day = None
+                if sharpen and have is not None:
+                    blurry_day = have.day
             else:
                 state_now = _read_json(state_path)
                 since = state_now.get("wanted_since")
@@ -1297,8 +1680,8 @@ def _refresh(data_dir: Path, job: _Job) -> None:
                     if isinstance(when, (int, float)) and now - when < ORPHAN_AFTER_S
                 }
                 prune(pages, job.today, now, wanted if tracked and wanted else None)
-                note(f"{saved[0]}: {_saved_line(saved[1], size, took)}", "ok")
-        if saved is None:
+                note(f"{day}: {_saved_line(edition, size, saved_how, redraw=sharpen)}", "ok")
+        if saved is None and not sharpen:
             if have is not None:
                 note(f"keeping the {have.day} page")
             elif failure == "missing":
@@ -1317,7 +1700,8 @@ def _refresh(data_dir: Path, job: _Job) -> None:
         # Today's edition still missing (not out yet, or the CDN failing):
         # back off before asking again; the last good page stays up.
         backoff = _section(state, "retry")
-        if saved is not None and saved[0] >= job.today:
+        got_today = (saved is not None and saved[0] >= job.today) or current
+        if got_today:
             backoff.pop(job.code, None)
         else:
             entry = backoff.get(job.code)
@@ -1333,6 +1717,31 @@ def _refresh(data_dir: Path, job: _Job) -> None:
             for code, entry in backoff.items()
             if isinstance(entry, dict) and entry.get("day") == today_iso
         }
+        oldest = (job.today - timedelta(days=LOOKBACK_DAYS)).isoformat()
+        retry = {
+            code: entry
+            for code, entry in _section(state, "pdf_retry").items()
+            if isinstance(entry, dict)
+            and isinstance(entry.get("day"), str)
+            and entry["day"] >= oldest
+        }
+        if blurry_day is not None and blurry_day < job.today:
+            # Only today's edition is ever asked for its PDF again
+            # (_wants_sharper runs for today's page), so an earlier one gets
+            # no retry record.
+            retry.pop(job.code, None)
+            note(f"{blurry_day}: keeping the JPG, an earlier edition's PDF isn't asked for again")
+        elif blurry_day is not None:
+            tries = _pdf_retry(state, job.code, blurry_day)[0] + 1
+            wait = min(PDF_RETRY_S * 2 ** min(tries - 1, 16), PDF_RETRY_MAX_S)
+            retry[job.code] = {"day": blurry_day.isoformat(), "tries": tries, "after": now + wait}
+            if tries < PDF_MAX_TRIES:
+                note(f"{blurry_day}: PDF asked for again in {_duration(wait)}")
+            else:
+                note(f"{blurry_day}: no more PDF tries for this edition, keeping the JPG")
+        elif sharp_day is not None:
+            retry.pop(job.code, None)
+        state["pdf_retry"] = retry
         _append_log(state, job.code, notes)
         _write_json(state_path, state)
 
@@ -1340,12 +1749,15 @@ def _refresh(data_dir: Path, job: _Job) -> None:
 # ----- the worker's log --------------------------------------------------------
 #
 # The admin page shows what the worker did, newest last: per paper, the
-# editions it asked for, each saved page's size and how long it took, the
-# failures, plus the admin page's own Verify checks and Fetch now presses. Each line carries an outcome ("ok", "missing" for an
-# edition that isn't there, "error" for an outage or a page that couldn't be
-# saved, "" for a note). The lines live in state.json, at most LOG_LINES of
-# them. They hold paper codes, dates and what Freedom Forum or the network
-# answered; the widget has no secrets to leak into them.
+# editions it asked for, where each saved page came from (the PDF drawn here
+# at panel width, the JPEG with its PDF for the panel's browser to draw, or
+# the JPEG alone), its size and how long it took, the PDF retries and the
+# failures, plus the admin page's own Verify checks and Fetch now presses.
+# Each line carries an outcome ("ok", "missing" for an edition that isn't
+# there, "error" for an outage or a page that couldn't be saved, "" for a
+# note). The lines live in state.json, at most LOG_LINES of them. They hold
+# paper codes, dates and what Freedom Forum or the network answered; the
+# widget has no secrets to leak into them.
 
 LOG_LINES = 150
 LOG_OUTCOMES = ("ok", "missing", "error")
@@ -1354,13 +1766,46 @@ LOG_OUTCOMES = ("ok", "missing", "error")
 Note = tuple[float, str, str]
 
 
-def _not_found(trace: Trace) -> str:
-    return f"JPG {trace.jpg}" if trace.jpg and trace.jpg != "not out yet" else "not out yet"
+def _not_found(trace: Trace, *, pdf_only: bool) -> str:
+    if pdf_only:
+        return f"PDF {trace.pdf or 'not found'}"
+    if trace.pdf in ("", "not out yet") and trace.jpg == "not out yet":
+        return "not out yet"
+    parts = [f"PDF {trace.pdf}" if trace.pdf else "", f"JPG {trace.jpg}" if trace.jpg else ""]
+    return ", ".join(part for part in parts if part) or "not found"
 
 
-def _saved_line(body: bytes, size: tuple[int, int] | None, took: float) -> str:
-    dims = f"{size[0]}\u00d7{size[1]} px, " if size else ""
-    return f"{dims}{_kb(len(body))} in {took:.1f} s"
+def _saved_line(
+    edition: Edition,
+    size: tuple[int, int] | None,
+    how: tuple[Trace, float] | None,
+    *,
+    redraw: bool,
+) -> str:
+    """One log line for a saved edition: where it came from, its size and
+    how long it took, and why the PDF wasn't used when it wasn't."""
+    trace, took = how if how is not None else (Trace(), 0.0)
+    if edition.page is None:  # the PDF alone, for a page already saved
+        pdf = _kb(len(edition.pdf or b""))
+        return f"PDF {pdf} kept beside the JPG, for the panel to draw, in {took:.1f} s"
+    source = trace.source or ("PDF" if size and size[0] >= SHARP_MIN_WIDTH_PX else "JPG")
+    if redraw:
+        source = "redrawn from the PDF"
+    dims = f"{size[0]}×{size[1]} px, " if size else ""
+    line = f"{source}, {dims}{_kb(len(edition.page))}"
+    if edition.pdf is not None:
+        line += f" and a {_kb(len(edition.pdf))} PDF for the panel to draw"
+    line += f" in {took:.1f} s"
+    if trace.pdf and source == "JPG":
+        line += f" (PDF {trace.pdf})"
+    return line
+
+
+def _duration(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes / 60:g} h" if minutes % 60 == 0 else f"{minutes // 60} h {minutes % 60} min"
 
 
 def _log_entries(raw: Any) -> list[dict[str, Any]]:
@@ -1503,7 +1948,17 @@ def _select(
             code
             for code in candidates
             if (force or not _recently_checked(state, code, now, today))
-            and not edition_path(pages, code, today).is_file()
+            and (
+                not edition_path(pages, code, today).is_file()
+                or _wants_sharper(
+                    code,
+                    today,
+                    _is_sharp(edition_path(pages, code, today)),
+                    state,
+                    now,
+                    force,
+                )
+            )
         ]
     finally:
         _LOCK.release()
@@ -1570,7 +2025,10 @@ def fetch(
     code, page = picked.chosen
     styles = {p.code: p.css for p in papers}
     payload: dict[str, Any] = {
-        "url": f"/plugins/{PLUGIN_ID}/page/{page.path.name}",
+        # The width tells a JPEG page from the PDF drawn here, which replaces
+        # it under the same name: a browser holding the first (the route lets
+        # it keep a page a day) fetches the second.
+        "url": f"/plugins/{PLUGIN_ID}/page/{page.path.name}?w={page.width}",
         "code": code,
         "date": page.day.isoformat(),
         "width": page.width,
@@ -1581,6 +2039,10 @@ def fetch(
         # How client.js fits the page on a smaller screen.
         "fit": config["small_screens"],
     }
+    if page.pdf is not None and page.width < SHARP_MIN_WIDTH_PX:
+        # client.js draws this with PDF.js at the cell's own width, and falls
+        # back to ``url`` (the JPEG) when it can't.
+        payload["pdf_url"] = f"/plugins/{PLUGIN_ID}/page/{page.pdf.name}"
     _LAST_CLAIMED[key] = (now, payload)
     if code in line:
         # Only the shown paper's download changes this frame.
@@ -1659,7 +2121,8 @@ def choices(name: str) -> list[dict[str, str]]:
 #
 # The paper row's Verify button posts the code as typed (saved or not) and
 # gets back what a download of it would show: the newest edition in the last
-# LOOKBACK_DAYS, fetched through download_edition, in the widget's own network scope and within
+# LOOKBACK_DAYS, fetched through download_edition (the PDF drawn here at panel
+# width, or the JPEG and its PDF), in the widget's own network scope and within
 # VERIFY_BUDGET_S. Nothing is saved but a log line: the frame's pages are
 # the worker's to fetch, and Fetch now asks it to.
 
@@ -1697,17 +2160,17 @@ def verify_code(data_dir: Path, code: str, today: date | None = None) -> dict[st
     who = f"{name} ({code})" if name else code
     deadline = _clock() + VERIFY_BUDGET_S
     started = _clock()
-    got: tuple[date, bytes, Trace] | None = None
+    got: tuple[date, Edition, Trace] | None = None
     misses: list[str] = []
     try:
         for back in range(LOOKBACK_DAYS):
             day = today - timedelta(days=back)
             trace = Trace()
-            body = download_edition(code, day, deadline, trace=trace)
-            if body is not None:
-                got = (day, body, trace)
+            edition = download_edition(code, day, deadline, trace=trace)
+            if edition is not None and edition.page is not None:
+                got = (day, edition, trace)
                 break
-            misses.append(f"{day}: {_not_found(trace)}")
+            misses.append(f"{day}: {_not_found(trace, pdf_only=False)}")
     except Exception as err:  # CdnUnreachable, or the host refusing the egress
         reason = _short(err)
         log_line(data_dir, code, f"Verify: Freedom Forum unreachable ({reason})", "error")
@@ -1742,9 +2205,10 @@ def verify_code(data_dir: Path, code: str, today: date | None = None) -> dict[st
         if odd:
             message += f" What came back: {odd}."
         return {"ok": False, "tone": "bad", "chip": "Not found", "name": name, "message": message}
-    day, body, _trace = got
+    day, edition, trace = got
+    body = edition.page or b""
     size = page_size(body)
-    detail = _saved_line(body, size, took)
+    detail = _saved_line(edition, size, (trace, took), redraw=False)
     log_line(data_dir, code, f"Verify: {day}: {detail}", "ok")
     if day == today:
         chip, tone, which = "Works", "ok", f"today's page ({day:%b %d})"
@@ -1787,10 +2251,12 @@ def _timezone() -> tzinfo | None:
 _OUTCOME_LABELS = {"ok": "OK", "missing": "MISSING", "error": "ERROR"}
 
 
-def _saved_pages(pages: Path, today: date) -> dict[str, date]:
-    """Each paper's newest saved edition young enough to show, from the file
-    names alone: the admin page must not decode a page per paper. ``newest_page`` is what judges a
-    page for a render."""
+def _saved_pages(pages: Path, today: date) -> dict[str, tuple[date, str]]:
+    """Each paper's newest saved edition young enough to show and how it is
+    drawn ("here": the PDF drawn by the worker, "panel": its PDF beside it,
+    for client.js; "jpg": the JPEG alone), from the file names and a header
+    read alone: the admin page must not decode a page per paper.
+    ``newest_page`` is what judges a page for a render."""
     oldest = today - timedelta(days=LAST_GOOD_MAX_DAYS)
     newest: dict[str, tuple[date, Path]] = {}
     with contextlib.suppress(OSError):
@@ -1801,7 +2267,13 @@ def _saved_pages(pages: Path, today: date) -> dict[str, date]:
             code, day = parsed
             if code not in newest or day > newest[code][0]:
                 newest[code] = (day, path)
-    return {code: day for code, (day, _path) in newest.items()}
+
+    def how(path: Path) -> str:
+        if (_saved_width(path) or 0) >= SHARP_MIN_WIDTH_PX:
+            return "here"
+        return "panel" if pdf_path(path).is_file() else "jpg"
+
+    return {code: (day, how(path)) for code, (day, path) in newest.items()}
 
 
 def fetches_view(
@@ -1813,7 +2285,9 @@ def fetches_view(
     """The admin page's Fetches card and the paper rows' status.
 
     ``status``: what the worker is doing now (or when it last did
-    something), and the listed papers with no page. ``log``: the log,
+    something), the PDF retries that will really run (today's edition of a
+    listed paper, still on the JPEG alone) or have run out, and the listed
+    papers with no page. ``log``: the log,
     oldest first, one dict per line (``when``, ``code``, ``outcome`` label
     and ``tone``, ``text``). ``papers``: per listed code, a ``chip`` and
     ``tone`` for its row's head and a ``line`` saying what it shows.
@@ -1838,6 +2312,32 @@ def fetches_view(
         status.append(f"Fetching {line[0]} now{more}. Reload to see how it went.")
     elif entries:
         status.append(f"Last fetch {when(entries[-1]['at'], '%b %d, %H:%M')}.")
+    waiting, spent = [], []
+    for code, entry in sorted(_section(state, "pdf_retry").items()):
+        if not isinstance(entry, dict) or not isinstance(entry.get("day"), str):
+            continue
+        tries, after = entry.get("tries"), entry.get("after")
+        if isinstance(tries, bool) or not isinstance(tries, int):
+            continue
+        if not isinstance(after, (int, float)):
+            continue
+        page = edition_path(pages, code, today)
+        current = (
+            entry["day"] == today.isoformat()
+            and (listed is None or code in listed)
+            and page.is_file()
+            and not _is_sharp(page)
+        )
+        if not current:
+            continue  # an earlier edition's, a paper taken off the list, or done
+        if tries < PDF_MAX_TRIES:
+            waiting.append(f"{code} at {when(after, '%H:%M')} (try {tries + 1} of {PDF_MAX_TRIES})")
+        else:
+            spent.append(code)
+    if waiting:
+        status.append(f"Asking again for the sharper PDF: {', '.join(waiting)}.")
+    if spent:
+        status.append(f"Out of PDF tries for today, showing the smaller JPG: {', '.join(spent)}.")
     reasons = {
         "unreachable": "Freedom Forum unreachable",
         "missing": f"none in the last {LOOKBACK_DAYS} days",
@@ -1875,9 +2375,14 @@ def fetches_view(
         chip, tone = "Not fetched yet", ""
         parts: list[str] = []
         if code in saved:
-            day = saved[code]
+            day, drawn = saved[code]
             chip, tone = ("Today", "ok") if day == today else (f"{day:%b %d}", "")
-            parts.append(f"Shows the {day:%b %d} page.")
+            how = {
+                "here": "the PDF drawn at full width",
+                "panel": "the PDF, drawn at the panel's width",
+                "jpg": "the smaller JPG, blurrier",
+            }[drawn]
+            parts.append(f"Shows the {day:%b %d} page, from {how}.")
         elif code in failed:
             chip, tone = "No page", "bad"
             parts.append(f"No page: {reasons.get(str(failed[code]), str(failed[code]))}.")
@@ -2082,9 +2587,11 @@ def _render_page(
 # ----- page images -----------------------------------------------------------
 
 
-# The widget's <img> points here and the panel render fetches it over loopback
-# with no session (see app/auth.py). Read-only: it serves files this module
-# wrote, by a name that has to match the page-file pattern.
+# The widget's <img> and its PDF.js (for a page's PDF) point here, and the panel
+# render fetches them over loopback with no session (see app/auth.py).
+# Read-only: it serves files this module wrote, by a name that has to match a
+# page-file pattern. PDF.js itself is served by the host's plugin asset route
+# (static/pdfjs).
 RENDER_SAFE_ENDPOINTS: tuple[str, ...] = (f"{PLUGIN_ID}.serve_page",)
 
 
@@ -2266,9 +2773,13 @@ def blueprint() -> Blueprint:
             return redirect(_index_url(anchor="fetches"))
         today = _edition_today()
         pages = data_dir / PAGES_DIR
-        due = [code for code in papers if not edition_path(pages, code, today).is_file()]
+        due = [
+            code
+            for code in papers
+            if not (page := edition_path(pages, code, today)).is_file() or not _is_sharp(page)
+        ]
         if not due:
-            flash("Every paper already has today's page.", "ok")
+            flash("Every paper already has today's page and its PDF.", "ok")
             return redirect(_index_url(anchor="fetches"))
         with _scope(plugin):
             _enqueue(data_dir, due, today, force=True)
@@ -2285,9 +2796,14 @@ def blueprint() -> Blueprint:
         plugin = live_plugin()
         if _page_day(name) is None:
             abort(404)
-        # Each edition has its own file name, so a day's cache is safe.
+        pdf = name.endswith(".pdf")
+        # Each edition has its own file name (a page drawn here replacing the
+        # JPEG gets a new ``?w=``), so a day's cache is safe.
         return send_from_directory(
-            Path(plugin.data_dir) / PAGES_DIR, name, mimetype="image/jpeg", max_age=86400
+            Path(plugin.data_dir) / PAGES_DIR,
+            name,
+            mimetype="application/pdf" if pdf else "image/jpeg",
+            max_age=86400,
         )
 
     return bp

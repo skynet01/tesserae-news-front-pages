@@ -102,9 +102,10 @@ def sweep(
     max_bytes: int,
     grace_s: float = GRACE_S,
     now: float | None = None,
-    pattern: str = "*",
+    pattern: str | tuple[str, ...] = "*",
 ) -> list[str]:
-    """Delete the files in ``directory`` matching ``pattern`` that aren't in
+    """Delete the files in ``directory`` matching ``pattern`` (one glob, or
+    several) that aren't in
     ``keep`` (names) once unused for ``grace_s``; then, while the folder is
     over ``max_bytes``, the oldest such files unused for at least
     ``MIN_AGE_S``. Files in ``keep`` are never deleted. Returns the names
@@ -117,8 +118,10 @@ def sweep(
     kept = set(keep)
     files: list[tuple[float, int, Path]] = []
     total = 0
+    patterns = (pattern,) if isinstance(pattern, str) else pattern
+    paths = {path for glob in patterns for path in directory.glob(glob)}
     with contextlib.suppress(OSError):
-        for path in directory.glob(pattern):
+        for path in sorted(paths):
             with contextlib.suppress(OSError):
                 if not path.is_file():
                     continue

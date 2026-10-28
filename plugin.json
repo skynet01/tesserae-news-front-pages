@@ -6,7 +6,7 @@
   "locales": [
     "en"
   ],
-  "description": "Today's newspaper front pages from the Freedom Forum archive, one paper per render. Rotates through the papers on its admin page, each with its own optional CSS, or shows one pinned paper. Keeps the last good page up while a paper isn't out yet. No API key.",
+  "description": "Today's newspaper front pages from the Freedom Forum archive, drawn sharp from each paper's PDF at the panel's own width. One paper per render, rotating through the papers on its admin page (each with optional CSS) or pinned. Keeps the last good page up. No API key.",
   "icon": "ph-newspaper",
   "category": "reading",
   "supports": {

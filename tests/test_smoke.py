@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import http.client
+import importlib
 import importlib.util
 import io
 import json
@@ -46,8 +47,25 @@ def _jpeg(width: int = 700, height: int = 1342) -> bytes:
 PAGE = _jpeg()
 
 
+def _pdf(width_pt: int = 612, height_pt: int = 1188) -> bytes:
+    """A one-page PDF ``width_pt`` x ``height_pt`` points: white, with a black
+    band across the top tenth, so a drawn page can be told from a blank."""
+    img = Image.new("L", (width_pt, height_pt), 255)
+    img.paste(0, (0, 0, width_pt, height_pt // 10))
+    buf = io.BytesIO()
+    img.save(buf, format="PDF", resolution=72)
+    return buf.getvalue()
+
+
+PDF = _pdf()
+
+
 def _url(code: str, day: int) -> str:
     return f"{CDN}/jpg{day}/lg/{code}.jpg"
+
+
+def _pdf_url(code: str, day: int) -> str:
+    return f"{CDN}/pdf{day}/{code}.pdf"
 
 
 class _Resp:
@@ -130,6 +148,26 @@ class FakeCdn:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b""))  # type: ignore[arg-type]
         return hit if isinstance(hit, _Resp) else _Resp(hit)
 
+    @property
+    def jpgs(self) -> list[str]:
+        """The JPEG requests alone."""
+        return [url for url in self.calls if "/jpg" in url]
+
+    @property
+    def pdfs(self) -> list[str]:
+        """The PDF requests alone."""
+        return [url for url in self.calls if "/pdf" in url]
+
+
+@pytest.fixture(autouse=True)
+def no_rasteriser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The optional rasteriser (pypdfium2) is off, as on a host without it,
+    whatever this machine has, in this module's server and in the app's copy
+    (which looks it up afresh): the PDF is kept for client.js to draw. The
+    ``pdf`` fixture turns it on."""
+    monkeypatch.setitem(sys.modules, "pypdfium2", None)
+    monkeypatch.setattr(server, "rasteriser_available", lambda: False)
+
 
 @pytest.fixture
 def clocks(monkeypatch: pytest.MonkeyPatch) -> Clocks:
@@ -188,14 +226,22 @@ def _fetch_settled(tmp_path: Path, **kw: Any) -> dict[str, Any]:
     return _fetch(tmp_path, **kw)
 
 
-def _seed(tmp_path: Path, name: str, body: bytes = PAGE, *, idle_s: float = 0.0) -> Path:
-    """Save a page, last used ``idle_s`` seconds ago."""
+def _seed(
+    tmp_path: Path, name: str, body: bytes = PAGE, *, idle_s: float = 0.0, pdf: bool = False
+) -> Path:
+    """Save a page, last used ``idle_s`` seconds ago; with ``pdf``, its PDF
+    beside it too (the whole edition, as the worker saves it)."""
     path = tmp_path / "pages" / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(body)
+    files = [path]
+    if pdf:
+        files.append(path.with_suffix(".pdf"))
+        files[-1].write_bytes(PDF)
     if idle_s:
         then = time.time() - idle_s
-        os.utime(path, (then, then))
+        for file in files:
+            os.utime(file, (then, then))
     return path
 
 
@@ -543,8 +589,10 @@ def test_each_paper_gets_its_own_css(tmp_path: Path, cdn: FakeCdn, clocks: Clock
 
 def test_client_applies_the_css_to_the_page_image_only() -> None:
     js = (Path(server.__file__).parent / "client.js").read_text()
-    assert "img.style.cssText = paperCss(data)" in js
-    assert "${data.css" not in js and "${paperCss" not in js  # never through markup
+    assert "const style = paperCss(data);" in js
+    # The same declarations on the page, whichever draws it: the PDF's canvas or the JPEG.
+    assert "canvas.style.cssText = style;" in js and "img.style.cssText = style;" in js
+    assert "${data.css" not in js and "${paperCss" not in js and "${style" not in js
 
 
 # ----- rotation --------------------------------------------------------------
@@ -552,7 +600,7 @@ def test_client_applies_the_css_to_the_page_image_only() -> None:
 
 def _seed_today(tmp_path: Path, *codes: str) -> None:
     for code in codes:
-        _seed(tmp_path, f"{code}_20261025.jpg")
+        _seed(tmp_path, f"{code}_20261025.jpg", pdf=True)
 
 
 def _sends(tmp_path: Path, clocks: Clocks, count: int, **kw: Any) -> list[str]:
@@ -666,7 +714,9 @@ def test_bad_pinned_code_and_empty_list_are_errors(tmp_path: Path, cdn: FakeCdn)
 def test_payload_carries_size_and_css(tmp_path: Path, cdn: FakeCdn) -> None:
     _seed_today(tmp_path, "NY_NYT")
     assert _fetch(tmp_path) == {
-        "url": "/plugins/news_front_pages/page/NY_NYT_20261025.jpg",
+        "url": "/plugins/news_front_pages/page/NY_NYT_20261025.jpg?w=700",
+        # The PDF kept beside the JPEG, for client.js to draw.
+        "pdf_url": "/plugins/news_front_pages/page/NY_NYT_20261025.pdf",
         "code": "NY_NYT",
         "date": "2026-10-25",
         "width": 700,
@@ -784,7 +834,7 @@ def test_concurrent_renders_trigger_one_download(tmp_path: Path, cdn: FakeCdn) -
     _fetch(tmp_path, paper="NY_NYT", fresh=True)  # even a forced one joins the queued job
     cdn.gate.set()
     _settle(tmp_path)
-    assert cdn.calls == [_url("NY_NYT", 25)]
+    assert cdn.calls == [_url("NY_NYT", 25), _pdf_url("NY_NYT", 25)]  # one job
 
 
 class _HookLock:
@@ -951,7 +1001,7 @@ def test_falls_back_across_a_month_boundary(
     monkeypatch.setattr(server, "_edition_today", lambda: date(2026, 11, 1))
     cdn.pages = {_url("WSJ", 31): PAGE}
     assert _fetch_settled(tmp_path, paper="WSJ")["date"] == "2026-10-31"
-    assert cdn.calls == [_url("WSJ", 1), _url("WSJ", 31)]
+    assert cdn.calls == [_url("WSJ", 1), _url("WSJ", 31), _pdf_url("WSJ", 31)]
 
 
 def test_gives_up_after_three_days(tmp_path: Path, cdn: FakeCdn) -> None:
@@ -961,7 +1011,7 @@ def test_gives_up_after_three_days(tmp_path: Path, cdn: FakeCdn) -> None:
 
 
 def test_todays_page_on_disk_needs_no_network(tmp_path: Path, cdn: FakeCdn) -> None:
-    _seed(tmp_path, "NY_NYT_20261025.jpg")
+    _seed(tmp_path, "NY_NYT_20261025.jpg", pdf=True)
     data = _fetch(tmp_path, paper="NY_NYT")
     assert data["date"] == "2026-10-25"
     assert "live_refresh_s" not in data
@@ -1055,8 +1105,9 @@ def test_every_request_says_who_is_asking(cdn: FakeCdn) -> None:
     """cdn.freedomforum.org answers Python's default urllib User-Agent with a
     403, so the request carries the widget's own."""
     cdn.pages = {_url("WSJ", 25): PAGE}
-    assert server.download_edition("WSJ", TODAY) == PAGE
-    assert cdn.agents == [server.USER_AGENT]
+    assert server.download_edition("WSJ", TODAY) == server.Edition(PAGE)
+    assert cdn.calls == [_url("WSJ", 25), _pdf_url("WSJ", 25)]
+    assert cdn.agents == [server.USER_AGENT, server.USER_AGENT]
     assert server.USER_AGENT.startswith("tesserae/") and "Python-urllib" not in server.USER_AGENT
 
 
@@ -1066,6 +1117,421 @@ def test_client_snaps_the_page_to_whole_pixels() -> None:
     assert 'addEventListener("load", () => snapToPixels(img)' in js
     # The paper's CSS can't take the property the snap uses.
     assert server.sanitize_css("translate: 0 -2px") == ""
+
+
+# ----- the PDF: sharp pages ----------------------------------------------------
+
+needs_pdfium = pytest.mark.skipif(
+    importlib.util.find_spec("pypdfium2") is None, reason="pypdfium2 not installed"
+)
+
+
+@pytest.fixture
+def rasteriser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The optional rasteriser on (its child process imports the real
+    pypdfium2, so tests that draw need it installed: ``needs_pdfium``)."""
+    monkeypatch.setattr(server, "rasteriser_available", lambda: True)
+
+
+@pytest.fixture
+def pdf(rasteriser: None, cdn: FakeCdn) -> FakeCdn:
+    """The fake CDN with the optional rasteriser on."""
+    return cdn
+
+
+def _size(body: bytes | None) -> tuple[int, int] | None:
+    return server.page_size(body) if body else None
+
+
+def test_pdf_complete_wants_the_header_and_the_end() -> None:
+    assert server.pdf_complete(PDF)
+    assert not server.pdf_complete(PDF[: len(PDF) // 2])  # cut off
+    assert not server.pdf_complete(b"<html>%%EOF")
+    assert not server.pdf_complete(PAGE)
+
+
+# Without the rasteriser (a host without pypdfium2, the usual case): the JPEG
+# is the page and the PDF is kept beside it for client.js.
+
+
+def test_without_the_rasteriser_the_jpeg_comes_first_then_its_pdf(cdn: FakeCdn) -> None:
+    cdn.pages = {_url("WSJ", 25): PAGE, _pdf_url("WSJ", 25): PDF}
+    trace = server.Trace()
+    assert server.download_edition("WSJ", TODAY, trace=trace) == server.Edition(PAGE, PDF)
+    assert cdn.calls == [_url("WSJ", 25), _pdf_url("WSJ", 25)]
+    assert (trace.source, trace.pdf) == ("JPG", "")
+
+
+def test_no_jpeg_no_edition_and_no_pdf_asked_for(cdn: FakeCdn) -> None:
+    cdn.pages = {_pdf_url("WSJ", 25): PDF}
+    assert server.download_edition("WSJ", TODAY) is None
+    assert cdn.calls == [_url("WSJ", 25)]
+
+
+@pytest.mark.parametrize(
+    ("served", "why"),
+    [
+        (None, "not out yet"),
+        (b"<html>captive portal</html>", "not a whole PDF"),
+        (PDF[:200], "not a whole PDF"),  # cut off
+        (_Resp(PDF, {"Last-Modified": "Mon, 21 Sep 2026 06:00:00 GMT"}), "refused"),
+    ],
+    ids=["404", "html", "truncated", "stale"],
+)
+def test_a_pdf_that_wont_do_leaves_the_jpeg_alone(
+    cdn: FakeCdn, served: bytes | _Resp | None, why: str
+) -> None:
+    cdn.pages = {_url("WSJ", 25): PAGE}
+    if served is not None:
+        cdn.pages[_pdf_url("WSJ", 25)] = served
+    trace = server.Trace()
+    assert server.download_edition("WSJ", TODAY, trace=trace) == server.Edition(PAGE)
+    assert trace.pdf.startswith(why)
+
+
+def test_an_oversized_pdf_is_refused(cdn: FakeCdn, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "MAX_PDF_BYTES", 1000)
+    cdn.pages = {_url("WSJ", 25): PAGE, _pdf_url("WSJ", 25): _pdf(2000, 4000) + b" " * 2000}
+    assert server.download_edition("WSJ", TODAY) == server.Edition(PAGE)
+
+
+def test_a_pdf_outage_after_the_jpeg_keeps_the_jpeg(cdn: FakeCdn) -> None:
+    def urlopen(req: Any, timeout: float | None = None) -> _Resp:
+        if "/pdf" in req.full_url:
+            raise urllib.error.URLError("connection reset")
+        return cdn(req, timeout)
+
+    cdn.pages = {_url("WSJ", 25): PAGE}
+    trace = server.Trace()
+    with patch("urllib.request.urlopen", urlopen):
+        assert server.download_edition("WSJ", TODAY, trace=trace) == server.Edition(PAGE)
+    assert trace.pdf == "unreachable (connection reset)"
+
+
+def test_a_pdf_only_ask_reports_an_outage(cdn: FakeCdn) -> None:
+    cdn.down = True
+    with pytest.raises(server.CdnUnreachable):
+        server.download_edition("WSJ", TODAY, pdf_only=True)
+    assert cdn.calls == [_pdf_url("WSJ", 25)]
+
+
+def test_a_render_gets_the_pdf_beside_the_jpeg(tmp_path: Path, cdn: FakeCdn) -> None:
+    cdn.pages = {_url("WSJ", 25): PAGE, _pdf_url("WSJ", 25): PDF}
+    data = _fetch_settled(tmp_path, paper="WSJ")
+    assert data["url"] == "/plugins/news_front_pages/page/WSJ_20261025.jpg?w=700"
+    assert data["pdf_url"] == "/plugins/news_front_pages/page/WSJ_20261025.pdf"
+    assert (tmp_path / "pages" / "WSJ_20261025.pdf").read_bytes() == PDF
+    assert "WSJ" not in _state(tmp_path).get("pdf_retry", {})
+
+
+def test_todays_jpeg_alone_gets_its_pdf_once(tmp_path: Path, cdn: FakeCdn, clocks: Clocks) -> None:
+    """A page saved from the JPEG alone (by an earlier version, or while the
+    PDF wasn't out) gets its PDF when it is there: the render shows the JPEG
+    at once and the next one hands client.js the PDF too."""
+    _seed(tmp_path, "WSJ_20261025.jpg")
+    cdn.pages = {_pdf_url("WSJ", 25): PDF}
+    first = _fetch(tmp_path, paper="WSJ")
+    assert "pdf_url" not in first
+    assert first["live_pending"] == 1  # the PDF is on its way
+    _settle(tmp_path)
+    second = _fetch(tmp_path, paper="WSJ")
+    assert second["pdf_url"].endswith("/WSJ_20261025.pdf")
+    assert "live_pending" not in second
+    assert cdn.calls == [_pdf_url("WSJ", 25)]  # the PDF only: the JPEG is what it had
+    assert _log(tmp_path)[-1].startswith(
+        f"WSJ 2026-10-25: PDF {server._kb(len(PDF))} kept beside the JPG, for the panel to draw"
+    )
+    clocks.wall += 2 * server.RECHECK_S
+    _fetch_settled(tmp_path, paper="WSJ")
+    assert len(cdn.calls) == 1  # sharp now: nothing more to do
+
+
+def test_a_pdf_retry_that_finds_none_backs_off_then_stops(
+    tmp_path: Path, cdn: FakeCdn, clocks: Clocks
+) -> None:
+    _seed(tmp_path, "WSJ_20261025.jpg")
+    assert "pdf_url" not in _fetch_settled(tmp_path, paper="WSJ")
+    assert cdn.calls == [_pdf_url("WSJ", 25)]
+    retry = _state(tmp_path)["pdf_retry"]["WSJ"]
+    assert (retry["day"], retry["tries"]) == ("2026-10-25", 1)
+    assert retry["after"] == pytest.approx(clocks.wall + server.PDF_RETRY_S, abs=5)
+    # Inside the backoff (and the recheck wait) nothing is asked for.
+    clocks.wall += server.PDF_RETRY_S - 60
+    _fetch_settled(tmp_path, paper="WSJ")
+    assert len(cdn.calls) == 1
+    # Each later try waits twice as long, up to the cap, and the tries stop.
+    asked = []
+    for _ in range(3 * server.PDF_MAX_TRIES):
+        clocks.wall += server.PDF_RETRY_MAX_S
+        _fetch_settled(tmp_path, paper="WSJ")
+        asked.append(len(cdn.calls))
+    assert asked[-1] == server.PDF_MAX_TRIES
+    assert _state(tmp_path)["pdf_retry"]["WSJ"]["tries"] == server.PDF_MAX_TRIES
+    # A forced refresh asks again whatever the count.
+    cdn.pages = {_pdf_url("WSJ", 25): PDF}
+    forced = _fetch_settled(tmp_path, paper="WSJ", fresh=True)
+    assert forced["pdf_url"].endswith("/WSJ_20261025.pdf")
+    assert "WSJ" not in _state(tmp_path)["pdf_retry"]
+
+
+def test_a_pdf_published_after_the_jpeg_is_still_fetched(
+    tmp_path: Path, cdn: FakeCdn, clocks: Clocks
+) -> None:
+    cdn.pages = {_url("WSJ", 25): PAGE}
+    assert "pdf_url" not in _fetch_settled(tmp_path, paper="WSJ")
+    assert _state(tmp_path)["pdf_retry"]["WSJ"]["tries"] == 1
+    assert _log(tmp_path)[-1] == "WSJ 2026-10-25: PDF asked for again in 30 min"
+    cdn.pages[_pdf_url("WSJ", 25)] = PDF
+    clocks.wall += server.PDF_RETRY_S
+    assert "pdf_url" in _fetch_settled(tmp_path, paper="WSJ")
+    assert "WSJ" not in _state(tmp_path)["pdf_retry"]
+
+
+def test_an_outage_during_a_pdf_retry_is_tried_again_later(
+    tmp_path: Path, cdn: FakeCdn, clocks: Clocks
+) -> None:
+    _seed(tmp_path, "WSJ_20261025.jpg")
+    cdn.down = True
+    assert _fetch_settled(tmp_path, paper="WSJ")["date"] == "2026-10-25"
+    assert _state(tmp_path)["pdf_retry"]["WSJ"]["tries"] == 1
+    cdn.down = False
+    cdn.pages = {_pdf_url("WSJ", 25): PDF}
+    clocks.wall += server.PDF_RETRY_S
+    assert "pdf_url" in _fetch_settled(tmp_path, paper="WSJ")
+
+
+def test_a_pdf_beside_the_page_that_isnt_one_is_dropped(tmp_path: Path, cdn: FakeCdn) -> None:
+    page = _seed(tmp_path, "WSJ_20261025.jpg", pdf=True)
+    page.with_suffix(".pdf").write_bytes(b"<html>")
+    data = _fetch(tmp_path, paper="WSJ")
+    assert "pdf_url" not in data
+    assert not page.with_suffix(".pdf").exists()
+
+
+def test_the_page_route_serves_the_pdf(app: Flask, client: FlaskClient) -> None:
+    pages = _app_dir(app) / "pages"
+    pages.mkdir(parents=True)
+    (pages / "WSJ_20261025.pdf").write_bytes(PDF)
+    resp = client.get("/plugins/news_front_pages/page/WSJ_20261025.pdf")
+    assert (resp.status_code, resp.mimetype, resp.data) == (200, "application/pdf", PDF)
+    resp.close()
+    assert client.get("/plugins/news_front_pages/page/WSJ_20261025.pdf.bak").status_code == 404
+    assert client.get("/plugins/news_front_pages/page/wsj_20261025.pdf").status_code == 404
+
+
+def test_pdfs_follow_their_pages_out(tmp_path: Path) -> None:
+    """A PDF is kept only beside its paper's newest page, while that page is
+    the JPEG; older editions' PDFs, a PDF beside a page drawn here, and one
+    with no page go once unused for the grace period."""
+    pages = tmp_path / "pages"
+    newest = _seed(tmp_path, "WSJ_20261025.jpg", idle_s=IDLE, pdf=True)
+    older = _seed(tmp_path, "WSJ_20261024.jpg", idle_s=IDLE, pdf=True)
+    wide = _seed(tmp_path, "USAT_20261025.jpg", _jpeg(1440, 2700), idle_s=IDLE, pdf=True)
+    lone = _seed(tmp_path, "AZ_ADS_20261025.jpg", idle_s=IDLE, pdf=True)
+    lone.unlink()
+    fresh = _seed(tmp_path, "NY_NYT_20261024.jpg", pdf=True)
+    _seed(tmp_path, "NY_NYT_20261025.jpg", pdf=True)
+    gone = server.prune(pages, TODAY, time.time())
+    assert sorted(gone) == ["AZ_ADS_20261025.pdf", "USAT_20261025.pdf", "WSJ_20261024.pdf"]
+    assert newest.with_suffix(".pdf").exists() and older.exists() and wide.exists()
+    assert fresh.with_suffix(".pdf").exists()  # an older edition's, but just used
+
+
+def test_pdfs_count_towards_the_folder_budget(tmp_path: Path) -> None:
+    pages = tmp_path / "pages"
+    newest = _seed(tmp_path, "WSJ_20261025.jpg", idle_s=IDLE, pdf=True)
+    older = _seed(tmp_path, "NY_NYT_20261023.jpg", idle_s=IDLE)
+    big = pages / "NY_NYT_20261024.pdf"
+    _seed(tmp_path, "NY_NYT_20261024.jpg", idle_s=IDLE)
+    big.write_bytes(PDF + b"%" * 50_000 + b"\n%%EOF\n")
+    then = time.time() - IDLE
+    os.utime(big, (then, then))
+    server.prune(pages, TODAY, time.time(), {"WSJ", "NY_NYT"}, max_bytes=60_000)
+    assert newest.exists() and newest.with_suffix(".pdf").exists()  # on screen
+    assert not older.exists()  # the oldest page goes for the budget
+
+
+def test_the_job_saves_the_pdf_before_the_page(
+    tmp_path: Path, cdn: FakeCdn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A render that sees the new page must find its PDF beside it."""
+    order: list[str] = []
+    write = server._write_atomic
+
+    def recording(path: Path, payload: bytes) -> None:
+        order.append(path.suffix)
+        write(path, payload)
+
+    monkeypatch.setattr(server, "_write_atomic", recording)
+    cdn.pages = {_url("WSJ", 25): PAGE, _pdf_url("WSJ", 25): PDF}
+    _fetch_settled(tmp_path, paper="WSJ")
+    assert [suffix for suffix in order if suffix != ".json"] == [".pdf", ".jpg"]
+
+
+# With the rasteriser (pypdfium2 importable on the host): the PDF is drawn
+# here, as the bundled widget did.
+
+
+@needs_pdfium
+def test_rasterise_draws_page_one_at_panel_width(rasteriser: None) -> None:
+    body = server.rasterise_pdf(_pdf())
+    assert body is not None
+    with Image.open(io.BytesIO(body)) as img:
+        assert img.format == "JPEG"
+        assert img.width == server.RASTER_WIDTH_PX
+        assert abs(img.height - 1188 * server.RASTER_WIDTH_PX / 612) <= 1
+        grey = img.convert("L")
+        band, paper = grey.getpixel((700, 20)), grey.getpixel((700, 2000))
+        assert isinstance(band, int) and band < 40  # the band, drawn
+        assert isinstance(paper, int) and paper > 215  # the page, white
+
+
+@needs_pdfium
+@pytest.mark.parametrize(
+    "body",
+    [b"%PDF-1.4 not really", b"", _jpeg(), _pdf(100, 5000), _pdf(5000, 100)],
+    ids=["broken", "empty", "jpeg", "too-tall", "too-wide"],
+)
+def test_rasterise_refuses_what_it_cannot_draw(rasteriser: None, body: bytes) -> None:
+    assert server.rasterise_pdf(body) is None
+
+
+def test_rasterise_gives_up_on_a_stuck_or_failing_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "rasteriser_available", lambda: True)
+    monkeypatch.setattr(server, "_RASTER_CHILD", "import time; time.sleep(30)")
+    monkeypatch.setattr(server, "RASTER_TIMEOUT_S", 0.5)
+    start = time.monotonic()
+    assert server.rasterise_pdf(_pdf()) is None
+    assert time.monotonic() - start < 10
+    monkeypatch.setattr(server, "_RASTER_CHILD", "import sys; sys.stdout.write('junk')")
+    assert server.rasterise_pdf(_pdf()) is None
+    monkeypatch.setattr(server, "_RASTER_CHILD", "raise SystemExit(9)")
+    assert server.rasterise_pdf(_pdf()) is None
+
+
+def test_rasterise_child_caps_its_own_memory_and_cpu() -> None:
+    assert '"RLIMIT_AS", memory' in server._RASTER_CHILD
+    assert '"RLIMIT_CPU", cpu' in server._RASTER_CHILD
+    assert "document[0]" in server._RASTER_CHILD  # page one only
+
+
+def test_pypdfium2_is_never_a_dependency() -> None:
+    root = Path(server.__file__).parent
+    manifest = json.loads((root / "plugin.json").read_text())
+    assert "pypdfium2" not in json.dumps(manifest)
+    source = (root / "server.py").read_text()
+    assert source.count("import pypdfium2") == 1  # in the child's code only
+
+
+@needs_pdfium
+def test_with_the_rasteriser_the_pdf_comes_first(pdf: FakeCdn) -> None:
+    pdf.pages = {_pdf_url("WSJ", 25): _pdf(), _url("WSJ", 25): PAGE}
+    got = server.download_edition("WSJ", TODAY)
+    assert got is not None and got.pdf is None
+    size = _size(got.page)
+    assert size is not None and size[0] == server.RASTER_WIDTH_PX
+    assert pdf.calls == [_pdf_url("WSJ", 25)]
+
+
+def test_a_pdf_that_doesnt_draw_here_is_kept_for_the_panel(
+    pdf: FakeCdn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "rasterise_pdf", lambda body, width=0, timeout=0: None)
+    pdf.pages = {_pdf_url("WSJ", 25): PDF, _url("WSJ", 25): PAGE}
+    trace = server.Trace()
+    assert server.download_edition("WSJ", TODAY, trace=trace) == server.Edition(PAGE, PDF)
+    assert pdf.calls == [_pdf_url("WSJ", 25), _url("WSJ", 25)]  # the PDF isn't asked twice
+    assert trace.pdf.startswith("didn't draw here")
+
+
+@needs_pdfium
+def test_a_render_gets_the_sharp_page_and_its_size(tmp_path: Path, pdf: FakeCdn) -> None:
+    pdf.pages = {_pdf_url("WSJ", 25): _pdf()}
+    data = _fetch_settled(tmp_path, paper="WSJ")
+    assert data["url"].endswith(f"/WSJ_20261025.jpg?w={server.RASTER_WIDTH_PX}")
+    assert data["width"] == server.RASTER_WIDTH_PX
+    assert "pdf_url" not in data  # drawn already
+    assert not (tmp_path / "pages" / "WSJ_20261025.pdf").exists()
+
+
+@needs_pdfium
+def test_todays_jpeg_is_redrawn_from_the_pdf_where_it_can_be(tmp_path: Path, pdf: FakeCdn) -> None:
+    _seed(tmp_path, "WSJ_20261025.jpg")  # 700 px wide
+    pdf.pages = {_pdf_url("WSJ", 25): _pdf()}
+    assert _fetch(tmp_path, paper="WSJ")["url"].endswith("?w=700")
+    _settle(tmp_path)
+    second = _fetch(tmp_path, paper="WSJ")
+    assert second["url"].endswith(f"?w={server.RASTER_WIDTH_PX}")
+    assert re.fullmatch(
+        r"WSJ 2026-10-25: redrawn from the PDF, 1440×\d+ px, \d+ KB in \d+\.\d s",
+        _log(tmp_path)[-1],
+    )
+
+
+@needs_pdfium
+def test_a_slow_pdf_leaves_the_jpeg_its_time(pdf: FakeCdn, clocks: Clocks) -> None:
+    """A PDF that trickles in uses up its own share of the edition's time,
+    not the JPEG's: the fallback is still fetched."""
+
+    def tick() -> None:
+        clocks.mono += 1.0
+
+    pdf.pages = {_pdf_url("WSJ", 25): _Resp(_pdf(), on_read=tick), _url("WSJ", 25): PAGE}
+    start = clocks.mono
+    assert server.download_edition("WSJ", TODAY) == server.Edition(PAGE)
+    assert clocks.mono - start <= server.DOWNLOAD_BUDGET_S - server.JPEG_RESERVE_S + 1
+    assert pdf.calls == [_pdf_url("WSJ", 25), _url("WSJ", 25)]
+
+
+def test_drawing_gets_only_the_pdfs_time_left(
+    monkeypatch: pytest.MonkeyPatch, pdf: FakeCdn, clocks: Clocks
+) -> None:
+    timeouts: list[float] = []
+
+    def fake_rasterise(body: bytes, width: int = 0, timeout: float = 0) -> bytes | None:
+        timeouts.append(timeout)
+        return None
+
+    monkeypatch.setattr(server, "rasterise_pdf", fake_rasterise)
+    pdf.pages = {_pdf_url("WSJ", 25): PDF, _url("WSJ", 25): PAGE}
+    assert server.download_edition("WSJ", TODAY) == server.Edition(PAGE, PDF)
+    assert timeouts == [pytest.approx(server.DOWNLOAD_BUDGET_S - server.JPEG_RESERVE_S)]
+    # Too little left in the job: not drawn at all, and the JPEG still comes.
+    timeouts.clear()
+    deadline = clocks.mono + server.JPEG_RESERVE_S + server.RASTER_MIN_S - 1
+    assert server.download_edition("WSJ", TODAY, deadline) == server.Edition(PAGE, PDF)
+    assert timeouts == []
+
+
+# client.js, and what it draws with
+
+
+def test_client_waits_for_the_pdf_within_the_hosts_budget() -> None:
+    """client.js holds the composer's ready signal while it draws; the host
+    stops waiting at _COMPOSE_SIGNAL_TIMEOUT_MS. Room is left for the rest of
+    the page and the JPEG fallback's own load."""
+    js = (Path(server.__file__).parent / "client.js").read_text()
+    match = re.search(r"export const PDF_BUDGET_MS = (\d+);", js)
+    assert match
+    # An older Tesserae without the constant: the signal's floor has long been 25 s.
+    budget = getattr(importlib.import_module("app.renderer"), "_COMPOSE_SIGNAL_TIMEOUT_MS", 25_000)
+    assert int(match.group(1)) + 8_000 <= budget
+    assert "await drawPdf(" in js  # the render waits for the drawing
+    assert 'canvas.style.visibility = "hidden"' in js  # never shown half drawn
+
+
+def test_pdfjs_is_vendored_with_its_licence() -> None:
+    root = Path(server.__file__).parent / "static" / "pdfjs"
+    readme = (root / "README").read_text()
+    version = re.search(r"^Version:\s+(\S+)", readme, re.M)
+    assert version
+    for name in ("pdf.min.mjs", "pdf.worker.min.mjs"):
+        assert f'"{version.group(1)}"' in (root / name).read_text(encoding="utf-8")
+    assert "Apache License" in (root / "LICENSE").read_text()
+    for name in ("jbig2.wasm", "openjpeg.wasm", "qcms_bg.wasm"):
+        assert (root / "wasm" / name).read_bytes()[:4] == b"\0asm"
+    assert len(list((root / "cmaps").glob("*.bcmap"))) == 4
+    assert sum(p.stat().st_size for p in root.rglob("*") if p.is_file()) < 3 * 1024 * 1024
 
 
 # ----- the lock and handed-out pages -----------------------------------------
@@ -1080,7 +1546,7 @@ def test_a_handed_out_page_is_claimed(tmp_path: Path, cdn: FakeCdn) -> None:
 def test_a_busy_lock_answers_with_the_last_claimed_page(
     tmp_path: Path, cdn: FakeCdn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _seed(tmp_path, "NY_NYT_20261025.jpg")
+    _seed(tmp_path, "NY_NYT_20261025.jpg", pdf=True)
     claimed = _fetch(tmp_path, paper="NY_NYT")
     monkeypatch.setattr(server, "LOCK_WAIT_S", 0.05)
     with server._LOCK:
@@ -1096,7 +1562,7 @@ def test_a_page_just_handed_out_survives_a_newer_download(tmp_path: Path, cdn: F
     page's URL must not get a 404."""
     old = _seed(tmp_path, "WSJ_20261015.jpg", idle_s=IDLE)
     cdn.down = True
-    assert _fetch_settled(tmp_path, paper="WSJ")["url"].endswith("/WSJ_20261015.jpg")
+    assert _fetch_settled(tmp_path, paper="WSJ")["url"].endswith("/WSJ_20261015.jpg?w=700")
     cdn.down = False
     cdn.pages = {_url("WSJ", 25): PAGE, _url("USAT", 25): PAGE}
     assert _fetch_settled(tmp_path, paper="WSJ", fresh=True)["date"] == "2026-10-25"
@@ -1238,13 +1704,29 @@ def _log(tmp_path: Path) -> list[str]:
 
 
 def test_the_log_says_what_each_download_got(tmp_path: Path, cdn: FakeCdn) -> None:
-    cdn.pages = {_url("WSJ", 24): PAGE}
+    cdn.pages = {_url("WSJ", 24): PAGE, _pdf_url("WSJ", 24): PDF}
     _fetch_settled(tmp_path, paper="WSJ")
     assert _log(tmp_path) == [
         "WSJ 2026-10-25: not out yet",
-        f"WSJ 2026-10-24: 700×1342 px, {server._kb(len(PAGE))} in 0.0 s",
+        f"WSJ 2026-10-24: JPG, 700×1342 px, {server._kb(len(PAGE))} and a "
+        f"{server._kb(len(PDF))} PDF for the panel to draw in 0.0 s",
         "WSJ today's edition: next try in 30 min (try 2 of 6)",
     ]
+
+
+def test_an_earlier_editions_jpeg_gets_no_pdf_retry(tmp_path: Path, cdn: FakeCdn) -> None:
+    """Today's paper isn't out, yesterday's JPEG is kept without its PDF:
+    only today's edition is ever asked for its PDF again, so no retry is
+    recorded or promised for yesterday's."""
+    cdn.pages = {_url("WSJ", 24): PAGE}
+    assert _fetch_settled(tmp_path, paper="WSJ")["date"] == "2026-10-24"
+    assert "WSJ" not in _state(tmp_path).get("pdf_retry", {})
+    assert _log(tmp_path)[1].endswith(" (PDF not out yet)")
+    assert _log(tmp_path)[-1] == (
+        "WSJ 2026-10-24: keeping the JPG, an earlier edition's PDF isn't asked for again"
+    )
+    status = server.fetches_view(tmp_path, None, ["WSJ"], today=TODAY)["status"]
+    assert not any("PDF again" in line for line in status)
 
 
 def test_the_log_records_an_outage_and_the_page_kept(tmp_path: Path, cdn: FakeCdn) -> None:
@@ -1280,7 +1762,7 @@ def test_the_log_keeps_only_the_newest_lines() -> None:
 def test_the_fetches_card_sums_up_the_state_and_lists_the_log(tmp_path: Path) -> None:
     at = datetime(2026, 10, 25, 14, 3, 12, tzinfo=UTC).timestamp()
     for name in ("USAT_20261025.jpg", "NY_NYT_20261025.jpg", "WSJ_20261024.jpg"):
-        _seed(tmp_path, name)
+        _seed(tmp_path, name)  # 700 px, no PDF: the JPEG alone
     server._write_json(
         tmp_path / "state.json",
         {
@@ -1302,12 +1784,23 @@ def test_the_fetches_card_sums_up_the_state_and_lists_the_log(tmp_path: Path) ->
                 {"at": "soon", "code": "WSJ", "text": "a hand-edited line"},
             ],
             "failed": {"AZ_ADS": "missing", "OLD": "unreachable"},
+            "pdf_retry": {
+                "USAT": {"day": "2026-10-25", "tries": 2, "after": at + 3600},
+                "NY_NYT": {"day": "2026-10-25", "tries": server.PDF_MAX_TRIES, "after": at},
+                # An earlier edition's retry: jobs only ask for today's PDF.
+                "WSJ": {"day": "2026-10-24", "tries": 1, "after": at},
+                # A paper taken off the list.
+                "LAT": {"day": "2026-10-25", "tries": 1, "after": at},
+                "BAD": "junk",
+            },
         },
     )
     listed = ["NY_NYT", "WSJ", "USAT", "AZ_ADS", "CA_LAT"]
     view = server.fetches_view(tmp_path, UTC, listed, today=TODAY)
     assert view["status"] == [
         "Last fetch Oct 25, 14:03.",
+        "Asking again for the sharper PDF: USAT at 15:03 (try 3 of 6).",
+        "Out of PDF tries for today, showing the smaller JPG: NY_NYT.",
         "No page for AZ_ADS (none in the last 3 days).",
     ]
     assert [(e["when"], e["code"], e["outcome"], e["tone"], e["text"]) for e in view["log"]] == [
@@ -1326,7 +1819,7 @@ def test_the_fetches_card_sums_up_the_state_and_lists_the_log(tmp_path: Path) ->
     papers = view["papers"]
     assert list(papers) == listed
     assert papers["NY_NYT"]["chip"] == "Today" and papers["NY_NYT"]["tone"] == "ok"
-    assert papers["NY_NYT"]["line"] == "Shows the Oct 25 page."
+    assert papers["NY_NYT"]["line"] == "Shows the Oct 25 page, from the smaller JPG, blurrier."
     assert papers["WSJ"]["chip"] == "Oct 24" and papers["WSJ"]["tone"] == ""
     assert papers["WSJ"]["line"].endswith("Last fetched Oct 25 at 14:03.")
     assert papers["AZ_ADS"] == {
@@ -1336,6 +1829,14 @@ def test_the_fetches_card_sums_up_the_state_and_lists_the_log(tmp_path: Path) ->
         "Last checked Oct 25 at 14:03: no page in the last 3 days.",
     }
     assert papers["CA_LAT"]["chip"] == "Not fetched yet"
+    # USAT's PDF came since (kept for the panel), and NY_NYT's page was drawn
+    # here from its PDF: neither is waiting for a PDF any more.
+    _seed(tmp_path, "USAT_20261025.jpg", pdf=True)
+    _seed(tmp_path, "NY_NYT_20261025.jpg", _jpeg(1440, 2700))
+    sharp = server.fetches_view(tmp_path, UTC, listed, today=TODAY)
+    assert not any(line.startswith(("Asking", "Out of")) for line in sharp["status"])
+    assert "from the PDF, drawn at the panel's width" in sharp["papers"]["USAT"]["line"]
+    assert "from the PDF drawn at full width" in sharp["papers"]["NY_NYT"]["line"]
     empty = server.fetches_view(tmp_path / "none", UTC, today=TODAY)
     assert empty == {"status": [], "log": [], "running": False, "papers": {}}
 
@@ -1362,7 +1863,7 @@ def test_the_admin_page_is_newspapers_and_shows_the_log(app: Flask, client: Flas
 
 
 def test_each_log_line_says_how_it_went(tmp_path: Path, cdn: FakeCdn) -> None:
-    cdn.pages = {_url("WSJ", 24): PAGE}
+    cdn.pages = {_url("WSJ", 24): PAGE, _pdf_url("WSJ", 24): PDF}
     _fetch_settled(tmp_path, paper="WSJ")
     cdn.down = True
     _fetch_settled(tmp_path, paper="USAT")
@@ -1381,14 +1882,18 @@ def test_the_admin_page_shows_each_papers_state_and_verify(
 ) -> None:
     module = _app_module(app)
     monkeypatch.setattr(module, "_edition_today", lambda: TODAY)
-    _seed(Path(app.config["PLUGIN_REGISTRY"].get("news_front_pages").data_dir), "WSJ_20261025.jpg")
+    _seed(
+        Path(app.config["PLUGIN_REGISTRY"].get("news_front_pages").data_dir),
+        "WSJ_20261025.jpg",
+        pdf=True,
+    )
     body = client.get("/plugins/news_front_pages/").get_data(as_text=True)
     settings = body[: body.index('id="fetches"')]
     # One per row, and one for the paper being added.
     assert body.count("data-nx-verify-btn>") == len(server.DEFAULT_PAPERS) + 1
     assert re.search(r"tg--ok nx-chip\">Today<", settings)
     assert settings.count(">Not fetched yet<") == len(server.DEFAULT_PAPERS) - 1
-    assert "Shows the Oct 25 page." in settings
+    assert "Shows the Oct 25 page, from the PDF, drawn at the panel&#39;s width." in settings
     assert "No fetches yet." in body
 
 
@@ -1422,25 +1927,32 @@ def _app_dir(app: Flask) -> Path:
 def test_verify_downloads_todays_page_without_saving_it(
     app: Flask, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    status, data, fake = _verify(app, client, monkeypatch, " ny_nyt ", {_url("NY_NYT", 25): PAGE})
+    status, data, fake = _verify(
+        app,
+        client,
+        monkeypatch,
+        " ny_nyt ",
+        {_url("NY_NYT", 25): PAGE, _pdf_url("NY_NYT", 25): PDF},
+    )
     assert status == 200
     assert data["ok"] is True
     assert (data["chip"], data["tone"], data["code"]) == ("Works", "ok", "NY_NYT")
     assert data["name"] == "The New York Times"
     assert data["message"].startswith(
-        "The New York Times (NY_NYT): downloaded today's page (Oct 25). 700\u00d71342 px"
+        "The New York Times (NY_NYT): downloaded today's page (Oct 25). JPG, 700\u00d71342 px, "
     )
+    assert f"and a {server._kb(len(PDF))} PDF for the panel to draw" in data["message"]
     thumb = data["thumb"]
     assert thumb.startswith("data:image/jpeg;base64,")
     import base64
 
     with Image.open(io.BytesIO(base64.b64decode(thumb.split(",", 1)[1]))) as img:
         assert img.size[0] == server.THUMB_WIDTH_PX
-    assert _url("NY_NYT", 25) in fake.calls
+    assert [u for u in fake.calls if "cdn." in u] == [_url("NY_NYT", 25), _pdf_url("NY_NYT", 25)]
     assert not list((_app_dir(app) / "pages").glob("*"))  # nothing saved
     last = _state(_app_dir(app))["log"][-1]
     assert last["code"] == "NY_NYT" and last["outcome"] == "ok"
-    assert last["text"].startswith("Verify: 2026-10-25: 700\u00d71342 px")
+    assert last["text"].startswith("Verify: 2026-10-25: JPG, 700\u00d71342 px")
 
 
 def test_verify_falls_back_to_the_newest_edition(
@@ -1461,7 +1973,7 @@ def test_verify_says_an_unknown_code_is_no_paper(
     assert data["message"].startswith("No paper with the code ZZ_NOPE: ")
     assert "thumb" not in data
     asked = [u for u in fake.calls if "ZZ_NOPE" in u]
-    assert asked == [_url("ZZ_NOPE", d) for d in (25, 24, 23)]
+    assert asked == [_url("ZZ_NOPE", d) for d in (25, 24, 23)]  # no JPG, no PDF asked
     last = _state(_app_dir(app))["log"][-1]
     assert (last["code"], last["outcome"]) == ("ZZ_NOPE", "missing")
 
@@ -1563,8 +2075,9 @@ def test_fetch_now_asks_for_the_papers_without_todays_page(
     module = _app_module(app)
     monkeypatch.setattr(module, "_edition_today", lambda: TODAY)
     data_dir = _app_dir(app)
-    _seed(data_dir, "NY_NYT_20261025.jpg")
-    fake = FakeCdn({_url("WSJ", 25): PAGE})
+    _seed(data_dir, "NY_NYT_20261025.jpg", pdf=True)
+    _seed(data_dir, "USAT_20261025.jpg")  # today's JPEG, but not its PDF
+    fake = FakeCdn({_url("WSJ", 25): PAGE, _pdf_url("WSJ", 25): PDF, _pdf_url("USAT", 25): PDF})
     with patch("urllib.request.urlopen", fake):
         resp = client.post("/plugins/news_front_pages/fetch")
         assert module._join_worker(data_dir, 10)
@@ -1573,7 +2086,10 @@ def test_fetch_now_asks_for_the_papers_without_todays_page(
     assert not any("NY_NYT" in u for u in fake.calls)
     assert _url("WSJ", 25) in fake.calls
     assert _url("AZ_ADS", 25) in fake.calls  # switched off, but still in the list
+    assert [u for u in fake.calls if "USAT" in u] == [_pdf_url("USAT", 25)]  # its PDF alone
     assert (data_dir / "pages" / "WSJ_20261025.jpg").exists()
+    assert (data_dir / "pages" / "WSJ_20261025.pdf").read_bytes() == PDF
+    assert (data_dir / "pages" / "USAT_20261025.pdf").read_bytes() == PDF
     log = _state(data_dir)["log"]
     assert log[0] == {
         "at": log[0]["at"],
@@ -1590,12 +2106,12 @@ def test_fetch_now_with_every_page_in_asks_for_nothing(
     module = _app_module(app)
     monkeypatch.setattr(module, "_edition_today", lambda: TODAY)
     for row in server.DEFAULT_PAPERS:
-        _seed(_app_dir(app), f"{row['code']}_20261025.jpg")
+        _seed(_app_dir(app), f"{row['code']}_20261025.jpg", pdf=True)
     fake = FakeCdn()
     with patch("urllib.request.urlopen", fake):
         resp = client.post("/plugins/news_front_pages/fetch", follow_redirects=True)
     assert fake.calls == []
-    assert "Every paper already has today&#39;s page." in resp.get_data(as_text=True)
+    assert "Every paper already has today&#39;s page and its PDF." in resp.get_data(as_text=True)
 
 
 # ----- retries and cleanup (media_lifecycle.py) ------------------------------
@@ -1620,7 +2136,7 @@ def test_an_unavailable_edition_is_retried_on_a_backoff(
     render()  # too soon: try 3 waits an hour
     clocks.wall += 30 * 60
     render()
-    assert calls == [1, 2, 2, 3]
+    assert calls == [1, 2, 2, 3]  # an outage ends a job at its first request
     retry = _state(tmp_path)["retry"]["NY_NYT"]
     assert (retry["day"], retry["tries"]) == ("2026-10-25", 3)
     # A forced refresh ignores the wait.
@@ -1628,7 +2144,7 @@ def test_an_unavailable_edition_is_retried_on_a_backoff(
     assert calls[-1] == 4
     # Once it works, the new page shows and the backoff is gone.
     cdn.down = False
-    cdn.pages = {_url("NY_NYT", 25): PAGE}
+    cdn.pages = {_url("NY_NYT", 25): PAGE, _pdf_url("NY_NYT", 25): PDF}
     assert render(fresh=True)["date"] == "2026-10-25"
     assert "NY_NYT" not in _state(tmp_path).get("retry", {})
 
