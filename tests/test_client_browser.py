@@ -26,7 +26,7 @@ from PIL import Image
 
 from app.main import create_app
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(os.environ.get("TESSERAE_TEST_ROOT", Path(__file__).resolve().parents[3]))
 PLUGIN = "news_front_pages"
 
 
@@ -35,7 +35,9 @@ def _chromium_available() -> bool:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
-            return Path(p.chromium.executable_path).exists()
+            return Path(
+                os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE", p.chromium.executable_path)
+            ).exists()
     except Exception:
         return False
 
@@ -88,7 +90,11 @@ def _jpeg(width: int = 700, height: int = 1359) -> bytes:
 def live(tmp_path: Path) -> Iterator[tuple[str, Flask]]:
     from werkzeug.serving import make_server
 
-    app = create_app(testing=False, data_root=tmp_path / "data", plugins_dir=REPO_ROOT / "plugins")
+    app = create_app(
+        testing=False,
+        data_root=tmp_path / "data",
+        plugins_dir=Path(os.environ.get("TESSERAE_TEST_PLUGINS", REPO_ROOT / "plugins")),
+    )
     app.config["TESTING"] = True
     store = app.config["SETTINGS_STORE"]
     store.patch_section("app", {"onboarded": True})
@@ -170,7 +176,9 @@ def _render(
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
         page = browser.new_page(viewport={"width": vw, "height": vh}, device_scale_factor=scale)
         if logs is not None:
             page.on("console", lambda m: logs.append(f"{m.type}: {m.text}"))
@@ -221,13 +229,13 @@ def test_the_canvas_follows_the_device_pixel_ratio(live: tuple[str, Flask]) -> N
 
 def test_a_broken_pdf_falls_back_to_the_jpeg(live: tuple[str, Flask]) -> None:
     base, app = live
-    page = _edition(app, b"%PDF-1.7\nthis is not a PDF at all\n%%EOF\n")
+    _edition(app, b"%PDF-1.7\nthis is not a PDF at all\n%%EOF\n")
     logs: list[str] = []
     with patch("urllib.request.urlopen", _no_network):
         got = _render(base, logs=logs)
-    assert "canvas" not in got
-    assert got["img"]["src"].endswith(f"/page/{page.name}?w=700")
-    assert got["img"]["w"] == 700  # loaded
+    assert "img" not in got
+    assert got["canvas"]["w"] == 700  # the fallback JPEG, processed at its own size
+    assert got["canvas"]["band"] < 40 and got["canvas"]["paper"] > 215
     assert any("drew the JPEG, the PDF failed" in line for line in logs)
 
 
@@ -235,7 +243,7 @@ def test_a_missing_pdf_falls_back_to_the_jpeg(live: tuple[str, Flask]) -> None:
     """The PDF went between the render's data and the browser asking for it
     (pruned, say): a 404, so the JPEG."""
     base, app = live
-    page = _edition(app, vector_pdf())
+    _edition(app, vector_pdf())
     module = app.config["PLUGIN_REGISTRY"].get(PLUGIN).server_module
     real = module._pdf_beside
 
@@ -250,8 +258,9 @@ def test_a_missing_pdf_falls_back_to_the_jpeg(live: tuple[str, Flask]) -> None:
         patch.object(module, "_pdf_beside", gone_after_the_look),
     ):
         got = _render(base)
-    assert "canvas" not in got
-    assert got["img"]["src"].endswith(f"/page/{page.name}?w=700")
+    assert "img" not in got
+    assert got["canvas"]["w"] == 700
+    assert got["canvas"]["band"] < 40 and got["canvas"]["paper"] > 215
 
 
 def test_a_pdf_over_its_budget_gives_up(live: tuple[str, Flask]) -> None:
@@ -262,7 +271,9 @@ def test_a_pdf_over_its_budget_gives_up(live: tuple[str, Flask]) -> None:
     page_file = _edition(app, vector_pdf())
     pdf_url = f"/plugins/{PLUGIN}/page/{page_file.with_suffix('.pdf').name}"
     with patch("urllib.request.urlopen", _no_network), sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
         page = browser.new_page()
         page.goto(f"{base}/_test/render?plugin={PLUGIN}&size=lg", wait_until="load")
         page.wait_for_function("window.__tesseraeComposed === true", timeout=30_000)

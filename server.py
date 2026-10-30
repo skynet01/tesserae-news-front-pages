@@ -71,8 +71,9 @@ How a render works:
 
 Layout under ``data_dir``::
 
-    config.json                   the papers and the small-screens choice, as
-                                  the admin page saves them
+    config.json                   the papers, the small-screens choice, the text
+                                  blackness, the text sharpness and the white
+                                  clean-up, as the admin page saves them
     pages/<CODE>_<YYYYMMDD>.jpg   one validated page per paper and edition (the
                                   PDF drawn at panel width, or the JPEG)
     pages/<CODE>_<YYYYMMDD>.pdf   that edition's PDF, beside a JPEG page, for
@@ -419,12 +420,27 @@ def parse_papers(value: Any) -> list[Paper]:
 
 # ----- the widget's own config ------------------------------------------------
 #
-# The paper list and the small-screens choice live in ``config.json`` in the
-# widget's data dir, written by its admin page; the manifest declares no
-# settings (Settings > Widgets has nothing for it).
+# The paper list, the small-screens choice, the text blackness and the text
+# sharpness live in ``config.json`` in the widget's data dir, written by its admin page; the
+# manifest declares no settings (Settings > Widgets has nothing for it).
 
 CONFIG_FILE = "config.json"
 SMALL_SCREENS = ("top", "whole")
+# "Text blackness": how hard client.js pulls the page's darkest tones (the
+# newspaper's text) to black, for a 16-grey panel. Off leaves the page alone.
+TEXT_BLACKNESS = ("off", "medium", "strong")
+DEFAULT_TEXT_BLACKNESS = "medium"
+# "Text sharpness": how strong an unsharp mask client.js runs over the page
+# before the blackness curve, so small print isn't soft. Off leaves it alone.
+TEXT_SHARPNESS = ("off", "light", "medium", "strong")
+DEFAULT_TEXT_SHARPNESS = "light"
+# "Clean white text edges": how far client.js snaps the near-white pixels beside the
+# letters (the pale grey halo that antialiasing leaves) to pure white.
+CLEAN_WHITE = ("off", "medium", "strong")
+DEFAULT_CLEAN_WHITE = "medium"
+# Optional 16-grey preprocessing; the display renderer still runs afterward.
+DITHERING = ("display", "none", "floyd-steinberg", "atkinson")
+DEFAULT_DITHERING = "display"
 
 # Guards config.json: every read-modify-write.
 _CONFIG_LOCK: threading.Lock = _shared("config_lock", threading.Lock)
@@ -450,9 +466,17 @@ def config_rows(value: Any) -> list[dict[str, Any]]:
 def _config(data: Mapping[str, Any]) -> dict[str, Any]:
     """A config with every key, from what was read (defaults for the rest)."""
     fit = data.get("small_screens")
+    blackness = data.get("text_blackness")
+    sharpness = data.get("text_sharpness")
+    clean = data.get("clean_white")
+    dithering = data.get("dithering")
     return {
         "papers": config_rows(data.get("papers", DEFAULT_PAPERS)),
         "small_screens": fit if fit in SMALL_SCREENS else "top",
+        "text_blackness": blackness if blackness in TEXT_BLACKNESS else DEFAULT_TEXT_BLACKNESS,
+        "text_sharpness": sharpness if sharpness in TEXT_SHARPNESS else DEFAULT_TEXT_SHARPNESS,
+        "clean_white": clean if clean in CLEAN_WHITE else DEFAULT_CLEAN_WHITE,
+        "dithering": dithering if dithering in DITHERING else DEFAULT_DITHERING,
     }
 
 
@@ -1982,7 +2006,7 @@ def fetch(
         return {"error": f"'{pinned_raw[:60]}' isn't a Freedom Forum paper code."}
     candidates = [pinned] if pinned else [p.code for p in papers if p.enabled]
     if not candidates:
-        where = "on the widget's admin page (Widgets → News, Newspapers)"
+        where = "on the widget's admin page (Widgets > Newspapers)"
         if papers:
             return {"error": f"Every paper in the list is switched off. Turn one on {where}."}
         return {"error": f"No papers to show. Add paper codes {where}."}
@@ -2038,6 +2062,13 @@ def fetch(
         "css": styles.get(code, ""),
         # How client.js fits the page on a smaller screen.
         "fit": config["small_screens"],
+        # How far client.js pulls the page's dark tones to black.
+        "text_blackness": config["text_blackness"],
+        # How strongly client.js sharpens the page before that.
+        "text_sharpness": config["text_sharpness"],
+        # How far client.js snaps near-white pixels to pure white.
+        "clean_white": config["clean_white"],
+        "dithering": config["dithering"],
     }
     if page.pdf is not None and page.width < SHARP_MIN_WIDTH_PX:
         # client.js draws this with PDF.js at the cell's own width, and falls
@@ -2403,7 +2434,7 @@ def fetches_view(
 #
 # Plain server-rendered forms, no scripts needed (the page's script only adds
 # niceties: Verify without a reload, live row titles, rows staying open). One
-# form holds every row, the add-a-paper fields and the small-screens choice,
+# form holds every row, the add-a-paper fields and the widget-wide choices,
 # so a row's buttons (move up or down, remove) submit the whole list: whatever
 # was edited saves with them, checked as one list first. A list that doesn't
 # check out is shown again as posted, with each problem under its field.
@@ -2422,6 +2453,10 @@ class Posted:
     rows: list[dict[str, Any]]
     new: dict[str, Any]  # the add-a-paper fields
     small_screens: str
+    text_blackness: str
+    text_sharpness: str
+    clean_white: str
+    dithering: str
     opened: set[int]  # rows the page had open (its script says; none without)
 
 
@@ -2443,10 +2478,18 @@ def _posted(form: Mapping[str, Any]) -> Posted | None:
     getlist = getattr(form, "getlist", None)
     opened = getlist("open") if getlist is not None else []
     fit = form.get("small_screens")
+    blackness = form.get("text_blackness")
+    sharpness = form.get("text_sharpness")
+    clean = form.get("clean_white")
+    dithering = form.get("dithering")
     return Posted(
         rows=[row(f"row-{index}") for index in range(total)],
         new=row("new"),
         small_screens=fit if fit in SMALL_SCREENS else "top",
+        text_blackness=blackness if blackness in TEXT_BLACKNESS else DEFAULT_TEXT_BLACKNESS,
+        text_sharpness=sharpness if sharpness in TEXT_SHARPNESS else DEFAULT_TEXT_SHARPNESS,
+        clean_white=clean if clean in CLEAN_WHITE else DEFAULT_CLEAN_WHITE,
+        dithering=dithering if dithering in DITHERING else DEFAULT_DITHERING,
         opened={int(v) for v in opened if str(v).isdigit() and int(v) < total},
     )
 
@@ -2491,6 +2534,10 @@ def _unsaved(posted: Posted, saved: Mapping[str, Any]) -> bool:
     return (
         _comparable(posted.rows) != _comparable(saved["papers"])
         or posted.small_screens != saved["small_screens"]
+        or posted.text_blackness != saved["text_blackness"]
+        or posted.text_sharpness != saved["text_sharpness"]
+        or posted.clean_white != saved["clean_white"]
+        or posted.dithering != saved["dithering"]
         or bool(posted.new["code"].strip())
     )
 
@@ -2547,6 +2594,10 @@ def _render_page(
     *,
     rows: list[dict[str, Any]],
     small_screens: str,
+    text_blackness: str,
+    text_sharpness: str,
+    clean_white: str,
+    dithering: str,
     new: Mapping[str, Any] | None = None,
     errors: Mapping[int, Mapping[str, str]] | None = None,
     new_errors: Mapping[str, str] | None = None,
@@ -2578,6 +2629,10 @@ def _render_page(
         can_add=len(rows) < MAX_PAPERS,
         max_papers=MAX_PAPERS,
         small_screens=small_screens,
+        text_blackness=text_blackness,
+        text_sharpness=text_sharpness,
+        clean_white=clean_white,
+        dithering=dithering,
         view=view,
         recheck_min=RECHECK_S // 60,
     )
@@ -2649,7 +2704,14 @@ def blueprint() -> Blueprint:
         config = load_config(Path(plugin.data_dir))
         opened = {int(v) for v in request.args.get("open", "").split(",") if v.isdigit()}
         return _render_page(
-            plugin, rows=config["papers"], small_screens=config["small_screens"], opened=opened
+            plugin,
+            rows=config["papers"],
+            small_screens=config["small_screens"],
+            text_blackness=config["text_blackness"],
+            text_sharpness=config["text_sharpness"],
+            clean_white=config["clean_white"],
+            dithering=config["dithering"],
+            opened=opened,
         )
 
     @bp.post("/papers")
@@ -2684,6 +2746,10 @@ def blueprint() -> Blueprint:
                 plugin,
                 rows=rows,
                 small_screens=posted.small_screens,
+                text_blackness=posted.text_blackness,
+                text_sharpness=posted.text_sharpness,
+                clean_white=posted.clean_white,
+                dithering=posted.dithering,
                 new=posted.new,
                 errors=errors,
                 new_errors=new_errors,
@@ -2694,7 +2760,15 @@ def blueprint() -> Blueprint:
             cleaned.append(added[0])
         try:
             save_config(
-                Path(plugin.data_dir), {"papers": cleaned, "small_screens": posted.small_screens}
+                Path(plugin.data_dir),
+                {
+                    "papers": cleaned,
+                    "small_screens": posted.small_screens,
+                    "text_blackness": posted.text_blackness,
+                    "text_sharpness": posted.text_sharpness,
+                    "clean_white": posted.clean_white,
+                    "dithering": posted.dithering,
+                },
             )
         except OSError as err:
             logger.warning("%s: couldn't save %s: %s", PLUGIN_ID, CONFIG_FILE, err)
@@ -2703,6 +2777,10 @@ def blueprint() -> Blueprint:
                 plugin,
                 rows=rows,
                 small_screens=posted.small_screens,
+                text_blackness=posted.text_blackness,
+                text_sharpness=posted.text_sharpness,
+                clean_white=posted.clean_white,
+                dithering=posted.dithering,
                 new=posted.new,
                 opened=opened,
                 status=500,
@@ -2758,6 +2836,10 @@ def blueprint() -> Blueprint:
             plugin,
             rows=posted.rows,
             small_screens=posted.small_screens,
+            text_blackness=posted.text_blackness,
+            text_sharpness=posted.text_sharpness,
+            clean_white=posted.clean_white,
+            dithering=posted.dithering,
             new=posted.new,
             opened=opened,
             verified={key: result},

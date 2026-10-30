@@ -1,4 +1,4 @@
-# News, Newspapers
+# Newspapers
 
 Today's newspaper front pages from the
 [Freedom Forum](https://frontpages.freedomforum.org) archive, one paper per
@@ -9,7 +9,7 @@ render, on a Tesserae panel.
 ## What it does
 
 - **Rotates through your papers.** The list lives on the widget's admin page
-  (Widgets, News, Newspapers). Each render shows the next paper in the
+  (Widgets, Newspapers). Each render shows the next paper in the
   rotation; a cell can instead be pinned to one paper in its Paper option.
 - **A paper's own CSS.** Each row has optional CSS (a few declarations such as
   `transform: translateY(-3.5%)` or `filter: contrast(1.15)`) applied to that
@@ -18,6 +18,24 @@ render, on a Tesserae panel.
 - **Sharp pages, from the PDF.** Each page is drawn from the paper's own PDF
   at the panel's width, so body text stays readable on a big panel (see
   [How pages are drawn](#how-pages-are-drawn)).
+- **Text blackness.** A widget-wide setting on the admin page (Off, Medium,
+  Strong; Medium by default, `text_blackness` in `config.json`) for a
+  16-grey panel: a levels curve that pulls only the darkest tones (the text)
+  to solid black and leaves midtones, highlights and the white paper, so
+  photos stay as they are. Medium sends 0-64 to black and rejoins the page at
+  120; Strong sends 0-80 to black and rejoins at 140.
+- **Text sharpness.** A widget-wide setting on the admin page (Off, Light,
+  Medium, Strong; Light by default, `text_sharpness` in `config.json`),
+  right under Text blackness: an unsharp mask on the page before the
+  blackness curve, so small print isn't soft on a 16-grey panel. Light is a
+  Gaussian radius of 1.0 px at 120 %, Medium 1.2 px at 200 %, Strong 1.5 px at
+  300 %. Flat areas and the white paper are left exactly as they are.
+- **Clean white text edges.** A widget-wide setting on the admin page (Off,
+  Medium, Strong; Medium by default, `clean_white` in `config.json`), under
+  Text sharpness: the paper around small print comes out pale grey rather than
+  white, which looks muddy on 16 greys. A white-point curve snaps near-white
+  tones to pure white and leaves everything darker as it was. Medium ramps up
+  from 170 and reaches white at 225; Strong from 150, white at 200.
 - **Pages download in the background**, so a render never waits on the
   network. A paper that isn't out yet shows its last good page, up to 30
   days old, and the worker tries again with a backoff.
@@ -57,9 +75,8 @@ only each paper's newest PDF is kept.
 
 ## Settings
 
-No API key and no Settings > Widgets entries. The paper list and the
-"On smaller screens" choice are kept in the widget's own `config.json` in its
-data folder, edited on the admin page.
+No API key. Edit the papers and appearance on Widgets > Newspapers.
+Settings stay in the widget's own `config.json` data file.
 
 | Cell option | Notes |
 | --- | --- |
@@ -110,3 +127,44 @@ Bundled: [PDF.js](https://github.com/mozilla/pdf.js) 6.4.299 by Mozilla,
 Apache License 2.0, in [`static/pdfjs`](static/pdfjs) with its licence and
 the licences of the image decoders, colour profile and CMaps it comes with
 (see [`static/pdfjs/README`](static/pdfjs/README)).
+
+## Appearance previews and dithering
+
+Text blackness, Text sharpness, Clean white text edges (`clean_white`, unchanged),
+and Dithering each show a live before/after crop at 2x zoom. The bundled sample
+is a small headline crop from the existing New York Times screenshot, October
+27, 2026; previews need no external requests and use the same processing as the
+PDF and JPEG paths. Each preview isolates its own control. Final display
+processing is excluded from the sample.
+
+Dithering (`dithering` in `config.json`) defaults to **Use the display's setting**
+(`display`): no extra processing, preserving the existing output. **None**,
+**Floyd-Steinberg**, and **Atkinson** preprocess the newspaper to 16 grey levels.
+None rounds to the nearest grey; Floyd-Steinberg diffuses all rounding error;
+Atkinson diffuses three quarters for a crisper result. Explicit modes turn
+colour photos grey too. The display renderer still applies its own palette,
+contrast, resizing and dithering afterward. These are preprocessing choices,
+not per-widget overrides of the display. Set the display's Dither mode to None
+for a 16-grey display when you want to avoid a second diffusion pass.
+
+Final frame dithering lives in `settings.json` under
+`renderers.<renderer>__<device>.dither`, edited on the display's settings page.
+Visionect uses `trmnl_png_gray16`. The three original choices are Floyd-Steinberg,
+Atkinson and None; current Tesserae also offers Jarvis-Judice-Ninke, Stucki,
+Bayer 8x8, Halftone dots and Crosshatch. The widget manifest's `render.dither`
+is not a runtime override. Hardware renderer overrides currently set PNG bit
+depth, not dithering. No core renderer files are changed here.
+
+Fetches starts collapsed and remembers its state in local storage when
+available. It remains keyboard accessible when storage is blocked.
+
+## Testing
+
+In a Tesserae checkout, run the plugin tests with the host's Python environment.
+For this standalone repository, copy it into a scratch `plugins/news_front_pages`
+directory (the directory name is the plugin ID; a symlink is not enough).
+Set `TESSERAE_TEST_ROOT` to the host checkout and `TESSERAE_TEST_PLUGINS` to that
+scratch `plugins` directory, then run `python -m pytest -q tests` with the host's
+Python environment. `PLAYWRIGHT_CHROMIUM_EXECUTABLE` selects a local Chromium
+binary for browser tests. The optional live PDF test stays off unless
+`NEWS_FRONT_PAGES_LIVE_PDF=1` is explicitly set.

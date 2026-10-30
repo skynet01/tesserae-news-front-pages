@@ -57,6 +57,13 @@ def _flashes(client: FlaskClient) -> list[str]:
         return [message for _, message in sess.get("_flashes", [])]
 
 
+APPEARANCE = {
+    "text_blackness": "medium",
+    "text_sharpness": "light",
+    "clean_white": "medium",
+    "dithering": "display",
+}
+
 DEFAULTS = [dict(row) for row in server.DEFAULT_PAPERS]
 
 
@@ -65,7 +72,7 @@ DEFAULTS = [dict(row) for row in server.DEFAULT_PAPERS]
 
 def test_load_config_has_defaults_and_writes_nothing_without_an_app(tmp_path: Path) -> None:
     config = server.load_config(tmp_path)
-    assert config == {"papers": server.DEFAULT_PAPERS, "small_screens": "top"}
+    assert config == {"papers": server.DEFAULT_PAPERS, "small_screens": "top", **APPEARANCE}
     assert not (tmp_path / "config.json").exists()
 
 
@@ -88,13 +95,13 @@ def test_load_config_reads_what_it_can(
     tmp_path: Path, body: str, papers: list[dict[str, Any]], fit: str
 ) -> None:
     (tmp_path / "config.json").write_text(body)
-    assert server.load_config(tmp_path) == {"papers": papers, "small_screens": fit}
+    assert server.load_config(tmp_path) == {"papers": papers, "small_screens": fit, **APPEARANCE}
 
 
 def test_save_config_writes_atomically_and_reads_back(tmp_path: Path) -> None:
     rows = [{"enabled": True, "code": "WSJ", "css": "opacity: 0.9"}]
     saved = server.save_config(tmp_path, {"papers": rows, "small_screens": "whole"})
-    assert saved == {"papers": rows, "small_screens": "whole"}
+    assert saved == {"papers": rows, "small_screens": "whole", **APPEARANCE}
     assert server.load_config(tmp_path) == saved
     assert [p.name for p in tmp_path.iterdir()] == ["config.json"]  # no temp file left
 
@@ -185,6 +192,7 @@ def test_save_stores_edits_and_switches(app: Flask, client: FlaskClient) -> None
             {"enabled": True, "code": "WSJ", "css": ""},
         ],
         "small_screens": "whole",
+        **APPEARANCE,
     }
 
 

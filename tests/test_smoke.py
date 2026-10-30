@@ -723,6 +723,10 @@ def test_payload_carries_size_and_css(tmp_path: Path, cdn: FakeCdn) -> None:
         "height": 1342,
         "css": NYT_CSS,
         "fit": "top",  # the "On smaller screens" setting
+        "text_blackness": "medium",
+        "text_sharpness": "light",
+        "clean_white": "medium",
+        "dithering": "display",
     }
     assert cdn.calls == []
 
@@ -1843,7 +1847,7 @@ def test_the_fetches_card_sums_up_the_state_and_lists_the_log(tmp_path: Path) ->
 
 def test_the_admin_page_is_newspapers_and_shows_the_log(app: Flask, client: FlaskClient) -> None:
     plugin = app.config["PLUGIN_REGISTRY"].get("news_front_pages")
-    assert plugin.name == "News, Newspapers"  # the widget keeps its name, in the menu too
+    assert plugin.name == "Newspapers"  # the widget keeps its name, in the menu too
     server._write_json(
         Path(plugin.data_dir) / "state.json",
         {"log": [{"at": time.time(), "code": "WSJ", "text": "2026-10-25: 700 px <b>"}]},
@@ -1852,14 +1856,15 @@ def test_the_admin_page_is_newspapers_and_shows_the_log(app: Flask, client: Flas
     assert "Newspapers, Tesserae</title>" in body
     assert re.search(r"<h1>.*Newspapers</h1>", body)
     assert re.search(
-        r'href="/plugins/news_front_pages/"[^>]*>\s*<i[^>]*></i>News, Newspapers\s*</a>', body
+        r'href="/plugins/news_front_pages/"[^>]*>\s*<i[^>]*></i>Newspapers\s*</a>', body
     )
     fetches = body[body.index('id="fetches"') :]
     assert "data-nx-log" in fetches
     assert "WSJ  <span" in fetches
     assert "2026-10-25: 700 px &lt;b&gt;" in fetches
-    assert "<details" not in fetches  # the log is open
-    assert "Pages aren&#39;t fetched on a timer" in body
+    assert re.search(r'<details id="fetches"[^>]*>', body)
+    assert not re.search(r'<details id="fetches"[^>]*\bopen\b', body)
+    assert "Fetch on first use each day" in body
 
 
 def test_each_log_line_says_how_it_went(tmp_path: Path, cdn: FakeCdn) -> None:
