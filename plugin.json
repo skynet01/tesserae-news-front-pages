@@ -1,7 +1,7 @@
 {
   "tesserae_compat": "1.x",
   "name": "News, Newspapers",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "kind": "widget",
   "locales": [
     "en"
@@ -44,5 +44,9 @@
     "network:cdn.freedomforum.org",
     "network:frontpages.freedomforum.org",
     "settings:plugin"
-  ]
+  ],
+  "lineups": {
+    "pin_option": "paper",
+    "noun": "papers"
+  }
 }
