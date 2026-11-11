@@ -16,7 +16,7 @@
             formaction="{{ verify_url }}" data-nx-verify-btn>
       <i class="ph ph-seal-check" aria-hidden="true"></i><span>Verify code</span>
     </button>
-    <span class="field-help nx-verify-hint">Downloads the newest page for the code as typed. Nothing is saved.</span>
+    <span class="field-help nx-verify-hint">Check this code without saving changes.</span>
     <div class="nx-verify-result" data-nx-verify-result role="status" aria-live="polite"{% if not result %} hidden{% endif %}>
       {%- if result %}
         {%- if result.thumb %}<img src="{{ result.thumb }}" alt="Top of the page that downloaded" class="nx-thumb">{% endif %}
@@ -36,7 +36,7 @@
 {% block main %}
 <div class="page-head">
   <h1><i class="ph ph-newspaper" aria-hidden="true"></i> Newspapers</h1>
-  <p class="page-blurb">Today's front pages from the Freedom Forum archive, one paper per render. Open a paper to change its code or crop, or to check that its code works.</p>
+  <p class="page-blurb">Today's front pages, one paper at a time.</p>
 </div>
 
 <div class="settings-section-list">
@@ -47,7 +47,7 @@
   <input type="hidden" name="count" value="{{ rows|length }}">
 
   {% call section_card(icon='newspaper', title='Papers', id='papers',
-                       description="The papers to rotate through, in order: one per render, moving on at most every four minutes. Switch a paper off to leave it out of the rotation without losing its row; a cell pinned to it still shows it.") %}
+                       description="Rotate in this order, at most once every four minutes; pinned papers ignore the switches.") %}
   {% if rows %}
   <div class="nx-list-head" aria-hidden="true"><span>Paper</span><span>In rotation</span></div>
   <ol class="nx-rows">
@@ -70,7 +70,7 @@
                      placeholder="NY_NYT" autocapitalize="characters" autocomplete="off" spellcheck="false"
                      data-nx-code{% if row.errors.code %} aria-invalid="true" aria-describedby="row-{{ i }}-code-error"{% endif %}>
               {{ field_error(row.errors.code, 'row-' ~ i ~ '-code-error') }}
-              <p class="field-help">Freedom Forum's code for the paper, as in its front page addresses (frontpages.freedomforum.org/newspapers/ny_nyt-The_New_York_Times is NY_NYT). The paper picker on a cell lists them all.</p>
+              <p class="field-help">Use the Freedom Forum code, for example NY_NYT.</p>
             </div>
             <div class="field">
               <label for="row-{{ i }}-css">Crop and appearance (CSS)</label>
@@ -78,7 +78,7 @@
                         placeholder="optional, e.g. filter: contrast(1.15)" data-nx-css{% if row.errors.css %} aria-invalid="true" aria-describedby="row-{{ i }}-css-error"{% endif %}>{{ row.css }}</textarea>
               {{ field_error(row.errors.css, 'row-' ~ i ~ '-css-error') }}
               {%- if row.css_note %}<p class="nx-css-note">{{ row.css_note }}</p>{% endif %}
-              <p class="field-help">Styles this paper's page image only. Move up: transform: translateY(-3%) (positive moves down). Zoom: transform: scale(1.2). Wider: width: 110%. Darker: filter: contrast(1.2). Several: separate with ;</p>
+              <p class="field-help">Style this paper only, for example transform: scale(1.2).</p>
             </div>
           </div>
           {%- if row.status %}<p class="nx-status-line">{{ row.status.line }}</p>{% endif %}
@@ -150,11 +150,70 @@
   <div class="field nx-fit">
     <label for="nx-small-screens">On smaller screens</label>
     <select id="nx-small-screens" name="small_screens">
-      <option value="top"{% if small_screens == 'top' %} selected{% endif %}>The top of the page, large enough to read (masthead and headlines)</option>
-      <option value="whole"{% if small_screens == 'whole' %} selected{% endif %}>The whole page, smaller</option>
+      <option value="top"{% if small_screens == 'top' %} selected{% endif %}>Readable headlines</option>
+      <option value="whole"{% if small_screens == 'whole' %} selected{% endif %}>Whole page</option>
     </select>
-    <p class="field-help">A big portrait screen shows the page full width from the top. A smaller or landscape screen can't show the whole page at a readable size: by default it shows the top of the page, the masthead and the main headlines, at a size you can read; or choose the whole page, smaller.</p>
+    <p class="field-help">Choose readable headlines or the whole page on small screens.</p>
   </div>
+
+  <div class="field nx-fit">
+    <label for="nx-text-blackness">Text blackness</label>
+    <select id="nx-text-blackness" name="text_blackness">
+      <option value="off"{% if text_blackness == 'off' %} selected{% endif %}>Off</option>
+      <option value="medium"{% if text_blackness == 'medium' %} selected{% endif %}>Medium</option>
+      <option value="strong"{% if text_blackness == 'strong' %} selected{% endif %}>Strong</option>
+    </select>
+    <p class="field-help">Deepen dark text and shadows without changing midtones.</p>
+    <figure class="nx-preview" hidden data-nx-preview="text_blackness">
+      <div><span>Before</span><canvas width="120" height="60" role="img" aria-label="Text blackness: before processing">Original newspaper letters.</canvas></div>
+      <div><span>After</span><canvas width="120" height="60" role="img" aria-label="Text blackness: selected setting">Letters with the selected setting.</canvas></div>
+    </figure>
+  </div>
+
+  <div class="field nx-fit">
+    <label for="nx-text-sharpness">Text sharpness</label>
+    <select id="nx-text-sharpness" name="text_sharpness">
+      <option value="off"{% if text_sharpness == 'off' %} selected{% endif %}>Off</option>
+      <option value="light"{% if text_sharpness == 'light' %} selected{% endif %}>Light</option>
+      <option value="medium"{% if text_sharpness == 'medium' %} selected{% endif %}>Medium</option>
+      <option value="strong"{% if text_sharpness == 'strong' %} selected{% endif %}>Strong</option>
+    </select>
+    <p class="field-help">Sharpen letter edges; Strong can add a light rim.</p>
+    <figure class="nx-preview" hidden data-nx-preview="text_sharpness">
+      <div><span>Before</span><canvas width="120" height="60" role="img" aria-label="Text sharpness: before processing">Original newspaper letters.</canvas></div>
+      <div><span>After</span><canvas width="120" height="60" role="img" aria-label="Text sharpness: selected setting">Letters with the selected setting.</canvas></div>
+    </figure>
+  </div>
+
+  <div class="field nx-fit">
+    <label for="nx-clean-white">Clean white text edges</label>
+    <select id="nx-clean-white" name="clean_white">
+      <option value="off"{% if clean_white == 'off' %} selected{% endif %}>Off</option>
+      <option value="medium"{% if clean_white == 'medium' %} selected{% endif %}>Medium</option>
+      <option value="strong"{% if clean_white == 'strong' %} selected{% endif %}>Strong</option>
+    </select>
+    <p class="field-help">Whiten pale text edges and photo highlights.</p>
+    <figure class="nx-preview" hidden data-nx-preview="clean_white">
+      <div><span>Before</span><canvas width="120" height="60" role="img" aria-label="Clean white text edges: before processing">Original newspaper letters.</canvas></div>
+      <div><span>After</span><canvas width="120" height="60" role="img" aria-label="Clean white text edges: selected setting">Letters with the selected setting.</canvas></div>
+    </figure>
+  </div>
+
+  <div class="field nx-fit">
+    <label for="nx-dithering">Dithering</label>
+    <select id="nx-dithering" name="dithering">
+      <option value="display"{% if dithering == 'display' %} selected{% endif %}>Use the display's setting</option>
+      <option value="none"{% if dithering == 'none' %} selected{% endif %}>None</option>
+      <option value="floyd-steinberg"{% if dithering == 'floyd-steinberg' %} selected{% endif %}>Floyd-Steinberg</option>
+      <option value="atkinson"{% if dithering == 'atkinson' %} selected{% endif %}>Atkinson</option>
+    </select>
+    <p class="field-help">Preprocess to 16 greys; the display still applies its settings.</p>
+    <figure class="nx-preview" hidden data-nx-preview="dithering">
+      <div><span>Before</span><canvas width="120" height="60" role="img" aria-label="Dithering: before processing">Original newspaper letters.</canvas></div>
+      <div><span>After</span><canvas width="120" height="60" role="img" aria-label="Dithering: selected setting">Letters with the selected setting.</canvas></div>
+    </figure>
+  </div>
+  <p class="field-help">Samples show letters at 2x zoom, before display processing.</p>
 
   <div class="nx-save">
     <button type="reset" class="dx-btn-ghost-sm" data-nx-discard>Discard changes</button>
@@ -165,8 +224,12 @@
   {% endcall %}
 </form>
 
-{% call section_card(icon='list-checks', title='Fetches', id='fetches',
-                     description="Pages aren't fetched on a timer. A paper is fetched the first time a frame shows it each day, then checked every " ~ recheck_min ~ " minutes until that day's edition is out. Meanwhile the frame keeps the newest page it has.") %}
+<details id="fetches" class="dx-section-card nx-fetches">
+  <summary class="dx-section-head"><span class="dx-section-title">Fetches</span>
+    <svg class="nx-fetch-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+  </summary>
+  <div class="dx-section-body">
+  <p class="field-help">Fetch on first use each day; retry every {{ recheck_min }} minutes until available.</p>
   <div class="nx-fetch-head">
     <div class="nx-status">{% for line in view.status %}<p>{{ line }}</p>{% endfor %}</div>
     <form method="post" action="{{ url_for(plugin_id ~ '.fetch_now') }}" class="nx-fetch" data-nx-reload>
@@ -181,13 +244,15 @@
   <pre class="dx-code dx-log-view nx-log" data-nx-log aria-label="Fetch log, newest last">
     {%- for e in view.log %}<span class="nx-line">{{ e.when }}  {{ e.code }}  <span class="nx-out{% if e.tone %} nx-out--{{ e.tone }}{% endif %}">{{ e.outcome }}</span> {{ e.text }}</span>{% if not loop.last %}{{ '\n' }}{% endif %}{% endfor -%}
   </pre>
-  <p class="field-help nx-log-help">Newest last. OK is a page saved; MISSING is an edition Freedom Forum doesn't have (not out yet, or not printed that day); ERROR is Freedom Forum not answering. Verify checks are logged too.</p>
+  <p class="field-help nx-log-help">Newest last: OK saved, MISSING unavailable, ERROR failed.</p>
   {% else %}
   <p class="nx-empty">No fetches yet. The first frame that shows a newspaper starts them, or press Fetch now.</p>
   {% endif %}
-{% endcall %}
+  </div>
+</details>
 </div>
 
+<script type="module" src="{{ url_for('plugins.plugin_asset', plugin_id=plugin_id, asset='static/appearance-preview.js') }}"></script>
 <script>
   (function () {
     var form = document.getElementById('nx-papers');
@@ -313,6 +378,19 @@
       });
     });
 
+    var fetches = document.getElementById('fetches');
+    var fetchesKey = 'tesserae.news_front_pages.fetches.open';
+    try { fetches.open = localStorage.getItem(fetchesKey) === 'true'; } catch { /* Storage can be blocked in embedded browsers. */ }
+    function rememberFetches() {
+      try { localStorage.setItem(fetchesKey, String(fetches.open)); } catch { /* Storage can be blocked in embedded browsers. */ }
+    }
+    window.addEventListener('pagehide', rememberFetches);
+    fetches.addEventListener('toggle', function () {
+      rememberFetches();
+      var log = fetches.querySelector('[data-nx-log]');
+      if (log && fetches.open) log.scrollTop = log.scrollHeight;
+    });
+
     // The log opens on its newest lines.
     var log = document.querySelector('[data-nx-log]');
     if (log) log.scrollTop = log.scrollHeight;
@@ -320,6 +398,15 @@
 </script>
 
 <style>
+  .nx-preview { display: flex; flex-wrap: wrap; gap: 12px; margin: 10px 0 0; }
+  .nx-preview[hidden] { display: none; }
+  .nx-preview > div { display: grid; gap: 4px; }
+  .nx-preview span { font-size: 12px; color: var(--t-muted); }
+  .nx-preview canvas { width: 120px; height: 60px; border: 1px solid var(--t-border); image-rendering: pixelated; }
+  .nx-fetches > summary { cursor: pointer; justify-content: space-between; }
+  .nx-fetch-chevron { flex: none; color: var(--t-muted); }
+  .nx-fetches[open] .nx-fetch-chevron { transform: rotate(90deg); }
+  .nx-fetches > summary:focus-visible { outline: 2px solid var(--t-accent); outline-offset: -2px; }
   .nx-form { margin: 0; }
   /* The column head over the rows: mono, quiet, ending over the switches. */
   .nx-list-head { display: flex; justify-content: space-between; gap: 12px; padding: 0 12px 8px; font-family: var(--t-font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--t-muted); }

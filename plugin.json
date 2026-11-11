@@ -1,6 +1,6 @@
 {
   "tesserae_compat": "1.x",
-  "name": "News, Newspapers",
+  "name": "Newspapers",
   "version": "0.1.0",
   "kind": "widget",
   "locales": [
@@ -23,7 +23,7 @@
       "label": "Paper",
       "default": "",
       "choices_from": "papers",
-      "help": "One paper every time, or the next paper from the list on the widget's admin page on each render."
+      "help": "Show one paper or rotate through the list."
     }
   ],
   "updates": {

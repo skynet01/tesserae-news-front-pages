@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import threading
 import urllib.error
 from collections.abc import Iterator
@@ -19,7 +20,7 @@ from PIL import Image
 
 from app.main import create_app
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(os.environ.get("TESSERAE_TEST_ROOT", Path(__file__).resolve().parents[3]))
 
 
 def _chromium_available() -> bool:
@@ -27,7 +28,9 @@ def _chromium_available() -> bool:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
-            return Path(p.chromium.executable_path).exists()
+            return Path(
+                os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE", p.chromium.executable_path)
+            ).exists()
     except Exception:
         return False
 
@@ -41,7 +44,11 @@ pytestmark = pytest.mark.skipif(
 def live(tmp_path: Path) -> Iterator[tuple[str, Flask]]:
     from werkzeug.serving import make_server
 
-    app = create_app(testing=False, data_root=tmp_path / "data", plugins_dir=REPO_ROOT / "plugins")
+    app = create_app(
+        testing=False,
+        data_root=tmp_path / "data",
+        plugins_dir=Path(os.environ.get("TESSERAE_TEST_PLUGINS", REPO_ROOT / "plugins")),
+    )
     app.config["TESTING"] = True
     store = app.config["SETTINGS_STORE"]
     store.patch_section("app", {"onboarded": True})
@@ -84,7 +91,9 @@ def test_rows_open_switch_edit_move_and_save(live: tuple[str, Flask]) -> None:
 
     base, app = live
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
         page = browser.new_page(viewport={"width": 1280, "height": 900})
         errors: list[str] = []
         page.on("pageerror", lambda err: errors.append(str(err)))
@@ -136,7 +145,9 @@ def test_a_bad_code_is_marked_and_nothing_saves(live: tuple[str, Flask]) -> None
 
     base, app = live
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
         page = browser.new_page(viewport={"width": 1280, "height": 900})
         page.goto(f"{base}/plugins/news_front_pages/", wait_until="networkidle")
         before = _config(app)
@@ -186,7 +197,9 @@ def test_verify_in_place_and_remove(live: tuple[str, Flask]) -> None:
         patch.object(module, "directory", lambda _d: {"USAT": "USA Today"}),
         sync_playwright() as p,
     ):
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
         page = browser.new_page(viewport={"width": 1280, "height": 900})
         errors: list[str] = []
         page.on("pageerror", lambda err: errors.append(str(err)))
@@ -210,13 +223,13 @@ def test_verify_in_place_and_remove(live: tuple[str, Flask]) -> None:
 
 
 def test_rows_fit_desktop_and_mobile(live: tuple[str, Flask]) -> None:
-    import os
-
     from playwright.sync_api import sync_playwright
 
     base, _ = live
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
         page = browser.new_page()
         for width, theme in ((1280, "light"), (390, "light"), (390, "dark")):
             page.emulate_media(color_scheme=theme)
@@ -262,7 +275,9 @@ def test_the_page_works_without_javascript(live: tuple[str, Flask]) -> None:
         return {"ok": False, "tone": "bad", "chip": "Not found", "message": f"No paper {code}."}
 
     with patch.object(module, "verify_code", verify_code), sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
         context = browser.new_context(java_script_enabled=False)
         page = context.new_page()
         # networkidle: leaving a page mid-download of a font leaves the
