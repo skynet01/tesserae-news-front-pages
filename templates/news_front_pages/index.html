@@ -70,15 +70,15 @@
                      placeholder="NY_NYT" autocapitalize="characters" autocomplete="off" spellcheck="false"
                      data-nx-code{% if row.errors.code %} aria-invalid="true" aria-describedby="row-{{ i }}-code-error"{% endif %}>
               {{ field_error(row.errors.code, 'row-' ~ i ~ '-code-error') }}
-              <p class="field-help">Use the Freedom Forum code, for example NY_NYT.</p>
+              <p class="field-help">Use the Freedom Forum code, such as NY_NYT for The New York Times, with underscores. Letters are converted to uppercase.</p>
             </div>
             <div class="field">
               <label for="row-{{ i }}-css">Crop and appearance (CSS)</label>
               <textarea id="row-{{ i }}-css" name="row-{{ i }}-css" rows="2" class="nx-mono" spellcheck="false"
-                        placeholder="optional, e.g. filter: contrast(1.15)" data-nx-css{% if row.errors.css %} aria-invalid="true" aria-describedby="row-{{ i }}-css-error"{% endif %}>{{ row.css }}</textarea>
+                        placeholder="filter: contrast(1.15);" data-nx-css{% if row.errors.css %} aria-invalid="true" aria-describedby="row-{{ i }}-css-error"{% endif %}>{{ row.css }}</textarea>
               {{ field_error(row.errors.css, 'row-' ~ i ~ '-css-error') }}
               {%- if row.css_note %}<p class="nx-css-note">{{ row.css_note }}</p>{% endif %}
-              <p class="field-help">Style this paper only, for example transform: scale(1.2).</p>
+              <p class="field-help">CSS declarations for this paper only, separated by semicolons. Leave blank for no extra styling.</p>
             </div>
           </div>
           {%- if row.status %}<p class="nx-status-line">{{ row.status.line }}</p>{% endif %}
@@ -123,12 +123,14 @@
                autocapitalize="characters" autocomplete="off" spellcheck="false"
                data-nx-code{% if new.errors.code %} aria-invalid="true" aria-describedby="new-code-error"{% endif %}>
         {{ field_error(new.errors.code, 'new-code-error') }}
+        <p class="field-help">Use the Freedom Forum code, such as NY_NYT for The New York Times, with underscores. Letters are converted to uppercase.</p>
       </div>
       <div class="field">
         <label for="new-css">Crop and appearance (CSS)</label>
         <textarea id="new-css" name="new-css" rows="2" class="nx-mono" spellcheck="false"
-                  placeholder="optional, e.g. filter: contrast(1.15)"{% if new.errors.css %} aria-invalid="true" aria-describedby="new-css-error"{% endif %}>{{ new.css }}</textarea>
+                  placeholder="filter: contrast(1.15);"{% if new.errors.css %} aria-invalid="true" aria-describedby="new-css-error"{% endif %}>{{ new.css }}</textarea>
         {{ field_error(new.errors.css, 'new-css-error') }}
+        <p class="field-help">CSS declarations separated by semicolons. Leave blank for no extra styling.</p>
       </div>
     </div>
     <div class="nx-add-foot">

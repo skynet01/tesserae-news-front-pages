@@ -1,5 +1,7 @@
 {
   "front_pages": "Front pages",
   "no_front_page": "No front page today.",
-  "fetching": "Fetching today's front page…"
+  "fetching": "Fetching today's front page…",
+  "settings.code.placeholder": "NY_NYT",
+  "settings.css.placeholder": "filter: contrast(1.15);"
 }
