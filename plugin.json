@@ -1,7 +1,7 @@
 {
   "tesserae_compat": "1.x",
   "name": "News, Newspapers",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "kind": "widget",
   "overrides_look": "Draws the newspaper on its own white paper",
   "locales": [
