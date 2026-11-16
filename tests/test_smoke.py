@@ -1847,7 +1847,7 @@ def test_the_fetches_card_sums_up_the_state_and_lists_the_log(tmp_path: Path) ->
 
 def test_the_admin_page_is_newspapers_and_shows_the_log(app: Flask, client: FlaskClient) -> None:
     plugin = app.config["PLUGIN_REGISTRY"].get("news_front_pages")
-    assert plugin.name == "Newspapers"  # the widget keeps its name, in the menu too
+    assert plugin.name == "News, Newspapers"  # the widget keeps its name, in the menu too
     server._write_json(
         Path(plugin.data_dir) / "state.json",
         {"log": [{"at": time.time(), "code": "WSJ", "text": "2026-10-25: 700 px <b>"}]},
@@ -1856,7 +1856,7 @@ def test_the_admin_page_is_newspapers_and_shows_the_log(app: Flask, client: Flas
     assert "Newspapers, Tesserae</title>" in body
     assert re.search(r"<h1>.*Newspapers</h1>", body)
     assert re.search(
-        r'href="/plugins/news_front_pages/"[^>]*>\s*<i[^>]*></i>Newspapers\s*</a>', body
+        r'href="/plugins/news_front_pages/"[^>]*>\s*<i[^>]*></i>News, Newspapers\s*</a>', body
     )
     fetches = body[body.index('id="fetches"') :]
     assert "data-nx-log" in fetches
