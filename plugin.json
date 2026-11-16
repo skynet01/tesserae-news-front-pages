@@ -3,6 +3,7 @@
   "name": "News, Newspapers",
   "version": "0.2.0",
   "kind": "widget",
+  "overrides_look": "Draws the newspaper on its own white paper",
   "locales": [
     "en"
   ],
