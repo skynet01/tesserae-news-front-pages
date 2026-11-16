@@ -723,6 +723,10 @@ def test_payload_carries_size_and_css(tmp_path: Path, cdn: FakeCdn) -> None:
         "height": 1342,
         "css": NYT_CSS,
         "fit": "top",  # the "On smaller screens" setting
+        "text_blackness": "medium",
+        "text_sharpness": "light",
+        "clean_white": "medium",
+        "dithering": "display",
     }
     assert cdn.calls == []
 
@@ -1858,8 +1862,9 @@ def test_the_admin_page_is_newspapers_and_shows_the_log(app: Flask, client: Flas
     assert "data-nx-log" in fetches
     assert "WSJ  <span" in fetches
     assert "2026-10-25: 700 px &lt;b&gt;" in fetches
-    assert "<details" not in fetches  # the log is open
-    assert "Pages aren&#39;t fetched on a timer" in body
+    assert re.search(r'<details id="fetches"[^>]*>', body)
+    assert not re.search(r'<details id="fetches"[^>]*\bopen\b', body)
+    assert "Fetch on first use each day" in body
 
 
 def test_each_log_line_says_how_it_went(tmp_path: Path, cdn: FakeCdn) -> None:
@@ -2204,3 +2209,32 @@ def test_lineup_items_are_the_papers_in_the_rotation(app: Flask) -> None:
     assert [i["key"] for i in items][:3] == ["NY_NYT", "WSJ", "USAT"]
     assert items[0]["label"].startswith("The New York Times")
     assert len({i["version"] for i in items}) == 1
+
+
+def test_advance_request_skips_the_hold_once_but_previews_and_pins_leave_it(
+    tmp_path: Path, cdn: FakeCdn, clocks: Clocks, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_today(tmp_path, "NY_NYT", "WSJ")
+    rows = [{"code": code, "enabled": True} for code in ("NY_NYT", "WSJ")]
+    first = _fetch(tmp_path, papers=rows)
+    advance = tmp_path / "advance"
+    advance.touch()
+    os.utime(advance, (clocks.wall, clocks.wall))
+    monkeypatch.setattr(server, "ADVANCE_FILE", advance)
+    assert _fetch(tmp_path, papers=rows, preview=True)["code"] == first["code"]
+    assert _fetch(tmp_path, papers=rows, paper="NY_NYT")["code"] == "NY_NYT"
+    assert "advance_seen" not in _state(tmp_path)
+    assert _fetch(tmp_path, papers=rows)["code"] == "WSJ"
+    assert _fetch(tmp_path, papers=rows)["code"] == "WSJ"
+    assert _state(tmp_path)["advance_seen"] == clocks.wall
+
+
+def test_stale_and_future_advance_requests_are_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    advance = tmp_path / "advance"
+    advance.touch()
+    monkeypatch.setattr(server, "ADVANCE_FILE", advance)
+    for stamp in (1000 - server.ADVANCE_TTL_S, 1001):
+        os.utime(advance, (stamp, stamp))
+        assert server.advance_requested({}, 1000) is None

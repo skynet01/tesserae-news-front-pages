@@ -1,8 +1,9 @@
 {
   "tesserae_compat": "1.x",
   "name": "News, Newspapers",
-  "version": "0.1.1",
+  "version": "0.2.2",
   "kind": "widget",
+  "overrides_look": "Draws the newspaper on its own white paper",
   "locales": [
     "en"
   ],
@@ -23,7 +24,7 @@
       "label": "Paper",
       "default": "",
       "choices_from": "papers",
-      "help": "One paper every time, or the next paper from the list on the widget's admin page on each render."
+      "help": "Show one paper or rotate through the list."
     }
   ],
   "updates": {
@@ -45,6 +46,7 @@
     "network:frontpages.freedomforum.org",
     "settings:plugin"
   ],
+  "tesserae_min": "0.512.0",
   "lineups": {
     "pin_option": "paper",
     "noun": "papers"
