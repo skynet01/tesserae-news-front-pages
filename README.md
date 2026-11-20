@@ -79,6 +79,13 @@ right-hand page. The page width follows its height, so the ad can vary in width.
 Normal portrait pages stay intact. This applies to PDFs and JPEGs, including
 editions already cached.
 
+Full-width bottom ads are removed only from NYT pages. Detection requires the
+printed footer's barcode above a white separator and a dense image band below
+it, without text-column gutters or a caption. The cut is checked against the
+original pixels. Ad-free pages, unfamiliar layouts and images too small to
+identify the footer stay intact. The shorter page keeps its aspect ratio and
+top alignment; the smaller-screen Whole page option fits all the content.
+
 ## Settings
 
 No API key. Edit the papers and appearance on Widgets > Newspapers.

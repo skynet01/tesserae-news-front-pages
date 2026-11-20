@@ -2,4 +2,4 @@
 
 ## [Unreleased]
 
-- Crop NYT front pages out of wide ad spreads when a white gutter confirms the page edge.
+- Crop NYT side and bottom ads when page gutters and footer checks confirm the content edge.

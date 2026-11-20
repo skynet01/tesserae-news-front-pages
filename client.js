@@ -126,6 +126,116 @@ export function cropNytPage(canvas, code) {
   ctx.putImageData(page, 0, 0);
 }
 
+// A bottom news photo can resemble a display ad. Require the printed footer's
+// barcode ABOVE a white separator, followed by a dense band with no column
+// gutters and no text caption below it. Unknown or low-resolution layouts stay.
+export function cropNytBottomAd(canvas, code) {
+  if (code !== "NY_NYT" || canvas.width < 250) return;
+  const ratio = canvas.height / canvas.width;
+  if (ratio < 1.3 || ratio > 2.2) return;
+  const sample = document.createElement("canvas");
+  sample.width = Math.min(350, canvas.width);
+  sample.height = Math.round(sample.width * ratio);
+  const ctx = sample.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return;
+  ctx.drawImage(canvas, 0, 0, sample.width, sample.height);
+  const { width: w, height: h } = sample;
+  const pixels = ctx.getImageData(0, 0, w, h).data;
+  const shade = (x, y) => {
+    const i = (y * w + x) * 4;
+    return Math.min(pixels[i], pixels[i + 1], pixels[i + 2]);
+  };
+  const x0 = Math.round(w * 0.03);
+  const x1 = w - x0;
+  const ink = new Float32Array(h);
+  for (let y = Math.floor(h * 0.55); y < h; y++) {
+    let dark = 0;
+    for (let x = x0; x < x1; x++) if (shade(x, y) < 230) dark++;
+    ink[y] = dark / (x1 - x0);
+  }
+  let bottom = h - 1;
+  while (bottom > h * 0.55 && ink[bottom] < 0.1) bottom--;
+  const barHeight = Math.round(w * 0.02);
+  const hasBarcode = (cut) => {
+    for (let y = Math.max(0, cut - Math.round(w * 0.12)); y + barHeight < cut; y++) {
+      let last = -1,
+        changes = 0,
+        dark = 0,
+        white = 0;
+      for (let x = Math.round(w * 0.74); x < w * 0.98; x++) {
+        let low = 255,
+          high = 0;
+        for (let yy = y; yy < y + barHeight; yy++) {
+          const v = shade(x, yy);
+          low = Math.min(low, v);
+          high = Math.max(high, v);
+        }
+        const value = high < 170 ? 0 : low > 200 ? 1 : -1;
+        if (value === 0) dark++;
+        if (value === 1) white++;
+        if (value >= 0 && last >= 0 && value !== last) changes++;
+        last = value;
+      }
+      if (changes >= 7 && dark >= w * 0.025 && white >= w * 0.04) return true;
+    }
+    return false;
+  };
+  for (let y = Math.floor(h * 0.55); y < bottom; y++) {
+    if (ink[y] > 0.02) continue;
+    const gapStart = y;
+    while (y < bottom && ink[y] <= 0.02) y++;
+    // Cut inside the white gap, away from either antialiased edge when the
+    // analysis thumbnail is mapped back onto a high-resolution PDF canvas.
+    const cut = Math.floor((gapStart + y) / 2);
+    const bandHeight = bottom - cut + 1;
+    if (bandHeight < w * 0.08 || bandHeight > h * 0.25) continue;
+    let dense = 0;
+    for (let yy = cut; yy <= bottom; yy++) dense += ink[yy];
+    if (dense / bandHeight < 0.88) continue;
+    // A caption or text columns after an image are evidence against an ad.
+    const tail = Math.max(2, Math.round(w * 0.02));
+    let tailInk = 0;
+    for (let yy = bottom - tail + 1; yy <= bottom; yy++) tailInk += ink[yy];
+    if (tailInk / tail < 0.8) continue;
+    let filled = 0;
+    for (let x = x0; x < x1; x++) {
+      let dark = 0;
+      for (let yy = cut; yy <= bottom; yy++) if (shade(x, yy) < 230) dark++;
+      if (dark / bandHeight > 0.7) filled++;
+    }
+    if (filled / (x1 - x0) < 0.95 || !hasBarcode(cut)) continue;
+    const original = canvas.getContext("2d");
+    if (!original) return;
+    // Thumbnail resampling can wash out a thin rule or the ad's first row.
+    // Locate real paper white in the original gap before committing the cut.
+    const scale = canvas.height / h;
+    const from = Math.max(0, Math.floor((gapStart - 1) * scale));
+    const to = Math.min(canvas.height, Math.ceil((y + 1) * scale));
+    const edge = Math.round(canvas.width * 0.03);
+    const span = canvas.width - edge * 2;
+    const gap = original.getImageData(edge, from, span, to - from).data;
+    let height = 0,
+      distance = Infinity;
+    for (let yy = from; yy < to; yy++) {
+      let white = 0;
+      for (let x = 0; x < span; x++) {
+        const i = ((yy - from) * span + x) * 4;
+        if (Math.min(gap[i], gap[i + 1], gap[i + 2]) >= 235) white++;
+      }
+      const d = Math.abs(yy - cut * scale);
+      if (white / span >= 0.98 && d < distance) {
+        height = yy + 1;
+        distance = d;
+      }
+    }
+    if (!height) continue;
+    const page = original.getImageData(0, 0, canvas.width, height);
+    canvas.height = height;
+    original.putImageData(page, 0, 0);
+    return;
+  }
+}
+
 // ----- text sharpness --------------------------------------------------------
 
 // Small print comes out soft on the panel, so the page gets an unsharp mask:
@@ -432,6 +542,7 @@ async function processedJpeg(url, table, sharpen, dithering, code) {
   if (!ctx || !canvas.width || !canvas.height) throw new Error("the JPEG has no size");
   ctx.drawImage(img, 0, 0);
   cropNytPage(canvas, code);
+  cropNytBottomAd(canvas, code);
   processCanvas(canvas, table, sharpen, dithering);
   return canvas;
 }
@@ -560,6 +671,7 @@ export async function drawPdf(
     });
     await drawing.promise;
     cropNytPage(canvas, code);
+    cropNytBottomAd(canvas, code);
     processCanvas(canvas, table, sharpen, dithering);
   })();
   work.catch(() => {}); // settled by the race below; this only keeps a late failure quiet
@@ -702,7 +814,7 @@ export default async function render(shadow, ctx) {
     table ||
     sharpen ||
     ["none", "floyd-steinberg", "atkinson"].includes(data.dithering) ||
-    nytPageWidth(width, height, data.code)
+    data.code === "NY_NYT"
   ) {
     try {
       const canvas = await processedJpeg(data.url, table, sharpen, data.dithering, data.code);

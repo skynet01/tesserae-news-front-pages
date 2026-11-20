@@ -141,7 +141,7 @@ _INSPECT = """() => {
   const root = host.shadowRoot;
   const canvas = root.querySelector('canvas.page');
   const img = root.querySelector('img.page');
-  const out = {cellW: host.getBoundingClientRect().width};
+  const out = {cellW: host.getBoundingClientRect().width, cellH: host.getBoundingClientRect().height};
   if (img) out.img = {src: img.getAttribute('src'), w: img.naturalWidth, complete: img.complete};
   if (canvas) {
     const ctx = canvas.getContext('2d');
@@ -155,11 +155,15 @@ _INSPECT = """() => {
     out.canvas = {
       w: canvas.width, h: canvas.height,
       cssW: canvas.getBoundingClientRect().width,
+      cssH: canvas.getBoundingClientRect().height,
+      top: canvas.getBoundingClientRect().top-host.getBoundingClientRect().top,
+      fit: root.querySelector('.w').className,
       visibility: getComputedStyle(canvas).visibility,
       ms: Number(canvas.dataset.drawnMs),
       band: luma(canvas.width / 2, 4),
       paper: luma(canvas.width / 2 + 8, canvas.height * 0.97),
       darkInRow: dark,
+      bottom: luma(canvas.width / 2, canvas.height - 1),
     };
   }
   return out;
@@ -174,6 +178,7 @@ def _render(
     vw: int = 1200,
     vh: int = 800,
     logs: list[str] | None = None,
+    screenshot: Path | None = None,
 ) -> dict[str, Any]:
     from playwright.sync_api import sync_playwright
 
@@ -198,6 +203,8 @@ def _render(
                 timeout=10_000,
             )
             result = page.evaluate(_INSPECT)
+        if screenshot is not None:
+            page.screenshot(path=str(screenshot))
         browser.close()
     return result
 
@@ -254,9 +261,10 @@ def test_nyt_ad_spread_shows_only_the_front_page(
     with patch("urllib.request.urlopen", _no_network):
         got = _render(base)
     canvas = got["canvas"]
-    assert abs(canvas["h"] / canvas["w"] - 336 / 175) < 0.01
+    assert abs(canvas["h"] / canvas["w"] - 566 / 350) < 0.02
+    assert canvas["bottom"] > 230  # the cut lands in paper white, not the ad
     if source != "pdf":
-        assert canvas["w"] == 175
+        assert canvas["w"] == 350
     elif fit == "top":
         assert canvas["w"] == 1200
     if fit == "whole":
@@ -296,7 +304,7 @@ def test_nyt_crop_preserves_normal_pages_and_follows_the_gutter(
                     ctx.drawImage(img, extra, 0);
                     const before = ctx.getImageData(0, 0, c.width, c.height);
                     const crop = index && code === 'NY_NYT';
-                    const left = crop ? c.width - 175 : 0;
+                    const left = crop ? c.width - 350 : 0;
                     m.cropNytPage(c, code);
                     const after = ctx.getImageData(0, 0, c.width, c.height);
                     let equal = true;
@@ -306,7 +314,7 @@ def test_nyt_crop_preserves_normal_pages_and_follows_the_gutter(
                             before.data[y*before.width*4+left*4+x]) equal = false;
                       }
                     }
-                    results.push({equal, w:c.width, expected:crop ? 175 : before.width});
+                    results.push({equal, w:c.width, expected:crop ? 350 : before.width});
                   }
                 }
               }
@@ -321,6 +329,122 @@ def test_nyt_crop_preserves_normal_pages_and_follows_the_gutter(
         )
         browser.close()
     assert all(r["equal"] and r["w"] == r["expected"] for r in result), result
+
+
+def test_nyt_bottom_ads_preserve_articles_and_other_papers(live: tuple[str, Flask]) -> None:
+    import base64
+
+    from playwright.sync_api import sync_playwright
+
+    base, _ = live
+    fixtures = Path(__file__).parent / "fixtures"
+    names = [f"nyt-202611{day}.jpg" for day in (15, 16, 17, 18)] + [
+        "nyt-20261119-normal.jpg",
+        "nyt-20261120-ad-spread.jpg",
+    ]
+    urls = [
+        "data:image/jpeg;base64," + base64.b64encode((fixtures / n).read_bytes()).decode()
+        for n in names
+    ]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
+        page = browser.new_page()
+        page.goto(base)
+        results = page.evaluate(
+            """async (urls) => {
+              const m = await import('/plugins/news_front_pages/client.js');
+              const results=[];
+              for (const [index,url] of urls.entries()) {
+                const img=new Image();img.src=url;await img.decode();
+                for (const code of ['NY_NYT','WSJ']) {
+                  const c=document.createElement('canvas');c.width=img.width;c.height=img.height;
+                  const ctx=c.getContext('2d');ctx.drawImage(img,0,0);
+                  m.cropNytPage(c,code);
+                  const before=ctx.getImageData(0,0,c.width,c.height);
+                  m.cropNytBottomAd(c,code);
+                  const after=ctx.getImageData(0,0,c.width,c.height);
+                  results.push({index,code,w:c.width,h:c.height,oldH:before.height,
+                    equal:after.data.every((value,i)=>value===before.data[i])});
+                }
+              }
+              // Vary only the real display ad's height. Article pixels and
+              // their footer remain exactly where the original put them.
+              const img=new Image();img.src=urls[1];await img.decode();
+              for (const bandHeight of [35,115,150]) {
+                const c=document.createElement('canvas');c.width=350;c.height=570+bandHeight+29;
+                const ctx=c.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,c.width,c.height);
+                ctx.drawImage(img,0,0,350,570,0,0,350,570);
+                ctx.drawImage(img,0,570,350,72,0,570,350,bandHeight);
+                const before=ctx.getImageData(0,0,c.width,c.height);
+                m.cropNytBottomAd(c,'NY_NYT');
+                const after=ctx.getImageData(0,0,c.width,c.height);
+                results.push({index:1,code:'NY_NYT',w:c.width,h:c.height,oldH:before.height,
+                    equal:after.data.every((value,i)=>value===before.data[i])});
+              }
+              // A band without a recognizable footer could be a news photo.
+              const c=document.createElement('canvas');c.width=img.width;c.height=img.height;
+              const ctx=c.getContext('2d');ctx.drawImage(img,0,0);
+              ctx.fillStyle='white';ctx.fillRect(350*.74,530,350*.24,35);
+              m.cropNytBottomAd(c,'NY_NYT');
+              results.push({index:0,code:'NY_NYT',w:c.width,h:c.height,oldH:img.height,equal:true});
+              // Text below the image is a caption, so keep the entire page.
+              ctx.drawImage(img,0,0);ctx.fillStyle='black';ctx.font='10px serif';
+              ctx.fillText('Photo caption: article text must stay visible.',10,660);
+              m.cropNytBottomAd(c,'NY_NYT');
+              results.push({index:0,code:'NY_NYT',w:c.width,h:c.height,oldH:img.height,equal:true});
+              const small=document.createElement('canvas');small.width=175;small.height=336;
+              small.getContext('2d').drawImage(img,0,0,175,336);
+              m.cropNytBottomAd(small,'NY_NYT');
+              results.push({index:0,code:'NY_NYT',w:175,h:small.height,oldH:336,equal:true});
+              // Other papers do not even read the canvas or its dimensions.
+              m.cropNytBottomAd({get width(){throw Error('read other paper')}},'WSJ');
+              return results;
+            }""",
+            urls,
+        )
+        browser.close()
+    for result in results:
+        assert result["equal"], result  # every retained article pixel is identical
+        if result["code"] == "NY_NYT" and result["index"] in (1, 5):
+            assert 1.60 < result["h"] / result["w"] < 1.64, result
+        else:
+            assert result["h"] == result["oldH"], result
+
+
+@pytest.mark.parametrize("size", [(1440, 2560), (1200, 1600)])
+@pytest.mark.parametrize("fit", ["top", "whole"])
+@pytest.mark.parametrize("source", ["jpeg", "pdf"])
+def test_cropped_nyt_keeps_its_aspect_and_masthead_on_portrait_panels(
+    live: tuple[str, Flask], size: tuple[int, int], fit: str, source: str
+) -> None:
+    base, app = live
+    jpeg = (Path(__file__).parent / "fixtures/nyt-20261120-ad-spread.jpg").read_bytes()
+    pdf = None
+    if source == "pdf":
+        out = io.BytesIO()
+        with Image.open(io.BytesIO(jpeg)) as image:
+            image.save(out, "PDF", resolution=72)
+        pdf = out.getvalue()
+    _edition(app, pdf, jpeg)
+    plugin = app.config["PLUGIN_REGISTRY"].get(PLUGIN)
+    config = plugin.server_module.load_config(Path(plugin.data_dir))
+    config["small_screens"] = fit
+    plugin.server_module.save_config(Path(plugin.data_dir), config)
+    w, h = size
+    with patch("urllib.request.urlopen", _no_network):
+        got = _render(base, query=f"size=lg&w={w}&h={h}", vw=w, vh=h)
+    canvas = got["canvas"]
+    assert abs(canvas["h"] / canvas["w"] - 566 / 350) < 0.02
+    assert abs(canvas["cssH"] / canvas["cssW"] - canvas["h"] / canvas["w"]) < 0.005
+    assert abs(canvas["top"]) <= 1  # the masthead stays at the top
+    assert canvas["visibility"] == "visible"
+    if fit == "top" or size == (1440, 2560):
+        assert abs(canvas["cssW"] - w) <= 1
+    else:
+        assert canvas["cssW"] < w
+        assert abs(canvas["cssH"] - h) <= 1
 
 
 def test_a_broken_pdf_falls_back_to_the_jpeg(live: tuple[str, Flask]) -> None:
