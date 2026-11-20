@@ -21,10 +21,9 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from app.main import create_app
 from flask import Flask
 from PIL import Image
-
-from app.main import create_app
 
 REPO_ROOT = Path(os.environ.get("TESSERAE_TEST_ROOT", Path(__file__).resolve().parents[3]))
 PLUGIN = "news_front_pages"
@@ -122,7 +121,10 @@ def _edition(app: Flask, pdf: bytes | None, jpeg: bytes | None = None) -> Path:
     data_dir = Path(plugin.data_dir)
     module.save_config(
         data_dir,
-        {"papers": [{"enabled": True, "code": "NY_NYT", "css": ""}], "small_screens": "top"},
+        {
+            "papers": [{"enabled": True, "code": "NY_NYT", "css": ""}],
+            "small_screens": "top",
+        },
     )
     page = Path(module.edition_path(data_dir / "pages", "NY_NYT", module._edition_today()))
     page.parent.mkdir(parents=True, exist_ok=True)
@@ -227,6 +229,100 @@ def test_the_canvas_follows_the_device_pixel_ratio(live: tuple[str, Flask]) -> N
     assert got["canvas"]["w"] == 2400
 
 
+@pytest.mark.parametrize("source", ["jpeg", "pdf", "broken-pdf"])
+@pytest.mark.parametrize("fit", ["top", "whole"])
+def test_nyt_ad_spread_shows_only_the_front_page(
+    live: tuple[str, Flask], source: str, fit: str
+) -> None:
+    base, app = live
+    jpeg = (Path(__file__).parent / "fixtures/nyt-20261120-ad-spread.jpg").read_bytes()
+    pdf = None
+    if source == "pdf":
+        out = io.BytesIO()
+        with Image.open(io.BytesIO(jpeg)) as img:
+            img.save(out, "PDF", resolution=72)
+        pdf = out.getvalue()
+    elif source == "broken-pdf":
+        pdf = b"%PDF-1.7 broken %%EOF"
+    _edition(app, pdf, jpeg)
+    # Cropping must also work when every appearance control is off.
+    plugin = app.config["PLUGIN_REGISTRY"].get(PLUGIN)
+    module = plugin.server_module
+    config = module.load_config(Path(plugin.data_dir))
+    config.update(text_blackness="off", text_sharpness="off", clean_white="off", small_screens=fit)
+    module.save_config(Path(plugin.data_dir), config)
+    with patch("urllib.request.urlopen", _no_network):
+        got = _render(base)
+    canvas = got["canvas"]
+    assert abs(canvas["h"] / canvas["w"] - 336 / 175) < 0.01
+    if source != "pdf":
+        assert canvas["w"] == 175
+    elif fit == "top":
+        assert canvas["w"] == 1200
+    if fit == "whole":
+        assert canvas["cssW"] < got["cellW"] / 2
+
+
+def test_nyt_crop_preserves_normal_pages_and_follows_the_gutter(
+    live: tuple[str, Flask],
+) -> None:
+    import base64
+
+    from playwright.sync_api import sync_playwright
+
+    base, _ = live
+    fixtures = Path(__file__).parent / "fixtures"
+    urls = [
+        "data:image/jpeg;base64," + base64.b64encode((fixtures / name).read_bytes()).decode()
+        for name in ("nyt-20261119-normal.jpg", "nyt-20261120-ad-spread.jpg")
+    ]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+        )
+        page = browser.new_page()
+        page.goto(base)
+        result = page.evaluate(
+            """async (urls) => {
+              const m = await import('/plugins/news_front_pages/client.js');
+              const results = [];
+              for (const [index, url] of urls.entries()) {
+                const img = new Image(); img.src = url; await img.decode();
+                for (const extra of (index ? [-50, 0, 80] : [0])) {
+                  for (const code of ['NY_NYT', 'WSJ']) {
+                    const c = document.createElement('canvas');
+                    c.width = img.width + extra; c.height = img.height;
+                    const ctx = c.getContext('2d');
+                    ctx.drawImage(img, extra, 0);
+                    const before = ctx.getImageData(0, 0, c.width, c.height);
+                    const crop = index && code === 'NY_NYT';
+                    const left = crop ? c.width - 175 : 0;
+                    m.cropNytPage(c, code);
+                    const after = ctx.getImageData(0, 0, c.width, c.height);
+                    let equal = true;
+                    for (let y = 0; y < c.height; y++) {
+                      for (let x = 0; x < c.width * 4; x++) {
+                        if (after.data[y*c.width*4+x] !==
+                            before.data[y*before.width*4+left*4+x]) equal = false;
+                      }
+                    }
+                    results.push({equal, w:c.width, expected:crop ? 175 : before.width});
+                  }
+                }
+              }
+              // A wide image without a white gutter is left intact.
+              const c = document.createElement('canvas'); c.width=700; c.height=671;
+              c.getContext('2d').fillRect(0, 0, 700, 671);
+              m.cropNytPage(c, 'NY_NYT');
+              results.push({equal:true, w:c.width, expected:700});
+              return results;
+            }""",
+            urls,
+        )
+        browser.close()
+    assert all(r["equal"] and r["w"] == r["expected"] for r in result), result
+
+
 def test_a_broken_pdf_falls_back_to_the_jpeg(live: tuple[str, Flask]) -> None:
     base, app = live
     _edition(app, b"%PDF-1.7\nthis is not a PDF at all\n%%EOF\n")
@@ -312,9 +408,12 @@ def _todays_nyt_pdf() -> bytes:
 
 
 @pytest.mark.skipif(
-    os.environ.get("NEWS_FRONT_PAGES_LIVE_PDF") != "1", reason="set NEWS_FRONT_PAGES_LIVE_PDF=1"
+    os.environ.get("NEWS_FRONT_PAGES_LIVE_PDF") != "1",
+    reason="set NEWS_FRONT_PAGES_LIVE_PDF=1",
 )
-def test_a_real_front_page_is_drawn_on_the_big_portrait_panel(live: tuple[str, Flask]) -> None:
+def test_a_real_front_page_is_drawn_on_the_big_portrait_panel(
+    live: tuple[str, Flask],
+) -> None:
     body = _todays_nyt_pdf()
     base, app = live
     _edition(app, body)

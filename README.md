@@ -73,6 +73,12 @@ blur, so the widget fetches both and draws the PDF:
 PDFs are capped at 30 MB, a slot holding last month's file is refused, and
 only each paper's newest PDF is kept.
 
+NYT editions sometimes include an ad beside the front page. The widget checks
+wide NYT images for a white gutter at the expected page edge, then keeps the
+right-hand page. The page width follows its height, so the ad can vary in width.
+Normal portrait pages stay intact. This applies to PDFs and JPEGs, including
+editions already cached.
+
 ## Settings
 
 No API key. Edit the papers and appearance on Widgets > Newspapers.

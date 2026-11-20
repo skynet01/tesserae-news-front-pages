@@ -90,6 +90,42 @@ export function pageFit(w, h, ratio, fit) {
   return w < READABLE_PX ? "zoom" : "full";
 }
 
+// ----- NYT ad spreads --------------------------------------------------------
+
+// Freedom Forum sometimes supplies NYT as an ad on the left and the front
+// page on the right (2026-11-20: 1758.24 x 1686.31 pt instead of 879.12 x
+// 1686.31). Infer the page width from its height, not from the ad's width.
+// Normal portrait pages and other papers never enter the pixel check.
+function nytPageWidth(width, height, code) {
+  const pageWidth = height * (879.12 / 1686.31);
+  return code === "NY_NYT" && width >= pageWidth * 1.5 && width <= pageWidth * 3 ? pageWidth : null;
+}
+
+export function cropNytPage(canvas, code) {
+  const pageWidth = nytPageWidth(canvas.width, canvas.height, code);
+  if (!pageWidth) return;
+  const width = Math.round(pageWidth);
+  const left = canvas.width - width;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return;
+  // Require a near-white gutter on both sides of the proposed cut. Ignore
+  // the printer's marks at the top and the wraparound ad along the bottom.
+  const margin = Math.max(1, Math.round(canvas.height * 0.003));
+  const top = Math.round(canvas.height * 0.04);
+  const height = Math.max(1, Math.round(canvas.height * 0.76));
+  const seam = ctx.getImageData(left - margin, top, margin * 2 + 1, height).data;
+  let white = 0;
+  for (let i = 0; i < seam.length; i += 4) {
+    if (seam[i] >= 235 && seam[i + 1] >= 235 && seam[i + 2] >= 235 && seam[i + 3] === 255) {
+      white += 1;
+    }
+  }
+  if (white < (seam.length / 4) * 0.98) return;
+  const page = ctx.getImageData(left, 0, width, canvas.height);
+  canvas.width = width;
+  ctx.putImageData(page, 0, 0);
+}
+
 // ----- text sharpness --------------------------------------------------------
 
 // Small print comes out soft on the panel, so the page gets an unsharp mask:
@@ -377,7 +413,7 @@ const JPEG_LOAD_MS = 10000;
 // The JPEG at ``url`` drawn onto a new canvas of its own size, sharpened
 // (``sharpen``, from sharpness()) and then put through ``table``, or rejects
 // (the caller then shows the plain <img>).
-async function processedJpeg(url, table, sharpen, dithering) {
+async function processedJpeg(url, table, sharpen, dithering, code) {
   const img = new Image();
   img.src = url;
   let timer = null;
@@ -395,6 +431,7 @@ async function processedJpeg(url, table, sharpen, dithering) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx || !canvas.width || !canvas.height) throw new Error("the JPEG has no size");
   ctx.drawImage(img, 0, 0);
+  cropNytPage(canvas, code);
   processCanvas(canvas, table, sharpen, dithering);
   return canvas;
 }
@@ -469,7 +506,8 @@ export async function drawPdf(
   budgetMs = PDF_BUDGET_MS,
   table = null,
   sharpen = null,
-  dithering = "display"
+  dithering = "display",
+  code = ""
 ) {
   const started = performance.now();
   const abort = new AbortController();
@@ -508,7 +546,10 @@ export async function drawPdf(
     canvas.height = Math.round(base.height);
     const box = canvas.getBoundingClientRect();
     const dpr = Number(globalThis.devicePixelRatio) || 1;
-    const size = canvasSize(box.width, dpr, ratio);
+    const pageWidth = nytPageWidth(base.width, base.height, code) || base.width;
+    // Draw the spread large enough that its front page still has one pixel
+    // per screen pixel after cropping. canvasSize keeps the usual memory caps.
+    const size = canvasSize(box.width * (base.width / pageWidth), dpr, ratio);
     if (!size) throw new Error("the cell has no width");
     canvas.width = size.w;
     canvas.height = size.h;
@@ -518,6 +559,7 @@ export async function drawPdf(
       background: "#ffffff",
     });
     await drawing.promise;
+    cropNytPage(canvas, code);
     processCanvas(canvas, table, sharpen, dithering);
   })();
   work.catch(() => {}); // settled by the race below; this only keeps a late failure quiet
@@ -608,6 +650,15 @@ export default async function render(shadow, ctx) {
     <div class="w is-bleed fit-${fit}" data-widget="news_front_pages"></div>`;
   const box = shadow.querySelector(".w");
   if (!box) return;
+  const fitCanvas = (canvas) => {
+    const actualFit = pageFit(
+      Number(ctx?.cell?.w) || 0,
+      Number(ctx?.cell?.h) || 0,
+      canvas.height / canvas.width,
+      data.fit
+    );
+    box.classList.replace(`fit-${fit}`, `fit-${actualFit}`);
+  };
   const style = paperCss(data);
   // The blackness curve and the white-point curve act on opposite ends of the
   // tones, so one pass through both tables is the same as two.
@@ -633,10 +684,12 @@ export default async function render(shadow, ctx) {
         PDF_BUDGET_MS,
         table,
         sharpen,
-        data.dithering
+        data.dithering,
+        data.code
       );
       canvas.dataset.drawnMs = String(ms);
       canvas.style.visibility = "";
+      fitCanvas(canvas);
       snapToPixels(canvas);
       return;
     } catch (err) {
@@ -645,14 +698,20 @@ export default async function render(shadow, ctx) {
     }
   }
 
-  if (table || sharpen || ["none", "floyd-steinberg", "atkinson"].includes(data.dithering)) {
+  if (
+    table ||
+    sharpen ||
+    ["none", "floyd-steinberg", "atkinson"].includes(data.dithering) ||
+    nytPageWidth(width, height, data.code)
+  ) {
     try {
-      const canvas = await processedJpeg(data.url, table, sharpen, data.dithering);
+      const canvas = await processedJpeg(data.url, table, sharpen, data.dithering, data.code);
       canvas.className = "page";
       canvas.setAttribute("role", "img");
       canvas.setAttribute("aria-label", alt);
       canvas.style.cssText = style;
       box.append(canvas);
+      fitCanvas(canvas);
       snapToPixels(canvas);
       return;
     } catch (err) {
